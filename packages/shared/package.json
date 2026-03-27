@@ -1,0 +1,17 @@
+{
+  "name": "@shynkro/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./out/index.js",
+  "exports": {
+    ".": {
+      "require": "./out/index.js",
+      "import": "./src/index.ts",
+      "default": "./out/index.js"
+    }
+  },
+  "scripts": {
+    "build:cjs": "bunx tsc -p tsconfig.cjs.json"
+  }
+}

@@ -1,0 +1,212 @@
+{
+  "name": "shynkro",
+  "displayName": "Shynkro",
+  "description": "Collaborative workspace for VS Code",
+  "version": "0.1.0",
+  "publisher": "atsika",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/atsika/shynkro.git"
+  },
+  "private": true,
+  "engines": {
+    "vscode": "^1.89.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "workspaceContains:.shynkro/project.json",
+    "onCommand:shynkro.init",
+    "onCommand:shynkro.clone",
+    "onCommand:shynkro.login",
+    "onCommand:shynkro.register",
+    "onCommand:shynkro.logout",
+    "onCommand:shynkro.relink",
+    "onCommand:shynkro.join",
+    "onCommand:shynkro.invite",
+    "onView:shynkro.presenceView",
+    "onView:shynkro.actionsView",
+    "onView:shynkro.conflictView",
+    "onCommand:shynkro.setServerUrl",
+    "onCommand:shynkro.resolveSyncIssues",
+    "onCommand:shynkro.shareWorkspace"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "shynkro.init",
+        "title": "Shynkro: Init Workspace"
+      },
+      {
+        "command": "shynkro.clone",
+        "title": "Shynkro: Clone Workspace"
+      },
+      {
+        "command": "shynkro.login",
+        "title": "Shynkro: Login"
+      },
+      {
+        "command": "shynkro.register",
+        "title": "Shynkro: Register"
+      },
+      {
+        "command": "shynkro.logout",
+        "title": "Shynkro: Logout"
+      },
+      {
+        "command": "shynkro.relink",
+        "title": "Shynkro: Re-link Workspace"
+      },
+      {
+        "command": "shynkro.deleteWorkspace",
+        "title": "Shynkro: Delete Workspace"
+      },
+      {
+        "command": "shynkro.join",
+        "title": "Shynkro: Join Workspace"
+      },
+      {
+        "command": "shynkro.invite",
+        "title": "Shynkro: Invite Member"
+      },
+      {
+        "command": "shynkro.copyWorkspaceId",
+        "title": "Shynkro: Copy Workspace ID"
+      },
+      {
+        "command": "shynkro.member.changeRole",
+        "title": "Change Role"
+      },
+      {
+        "command": "shynkro.member.remove",
+        "title": "Remove from Workspace"
+      },
+      {
+        "command": "shynkro.setServerUrl",
+        "title": "Shynkro: Set Server URL"
+      },
+      {
+        "command": "shynkro.member.hideCursorLabel",
+        "title": "Hide Cursor Label"
+      },
+      {
+        "command": "shynkro.member.showCursorLabel",
+        "title": "Show Cursor Label"
+      },
+      {
+        "command": "shynkro.member.follow",
+        "title": "Follow"
+      },
+      {
+        "command": "shynkro.member.unfollow",
+        "title": "Unfollow"
+      },
+      {
+        "command": "shynkro.resolveSyncIssues",
+        "title": "Shynkro: Resolve Sync Issues"
+      },
+      {
+        "command": "shynkro.shareWorkspace",
+        "title": "Shynkro: Share Workspace"
+      }
+    ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "shynkro.member.changeRole",
+          "when": "view == shynkro.presenceView && viewItem =~ /^shynkro\\.presence\\.other/",
+          "group": "shynkro@1"
+        },
+        {
+          "command": "shynkro.member.remove",
+          "when": "view == shynkro.presenceView && viewItem =~ /^shynkro\\.presence\\.other/",
+          "group": "shynkro@2"
+        },
+        {
+          "command": "shynkro.member.hideCursorLabel",
+          "when": "view == shynkro.presenceView && (viewItem == shynkro.presence.other || viewItem == shynkro.presence.other.following)",
+          "group": "shynkro@3"
+        },
+        {
+          "command": "shynkro.member.showCursorLabel",
+          "when": "view == shynkro.presenceView && (viewItem == shynkro.presence.other.labelHidden || viewItem == shynkro.presence.other.labelHidden.following)",
+          "group": "shynkro@3"
+        },
+        {
+          "command": "shynkro.member.follow",
+          "when": "view == shynkro.presenceView && (viewItem == shynkro.presence.other || viewItem == shynkro.presence.other.labelHidden)",
+          "group": "shynkro@4"
+        },
+        {
+          "command": "shynkro.member.unfollow",
+          "when": "view == shynkro.presenceView && (viewItem == shynkro.presence.other.following || viewItem == shynkro.presence.other.labelHidden.following)",
+          "group": "shynkro@4"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "shynkro-sidebar",
+          "title": "Shynkro",
+          "icon": "$(sync)"
+        }
+      ]
+    },
+    "views": {
+      "shynkro-sidebar": [
+        {
+          "id": "shynkro.presenceView",
+          "name": "Connected Users"
+        },
+        {
+          "id": "shynkro.actionsView",
+          "name": "Workspace"
+        },
+        {
+          "id": "shynkro.conflictView",
+          "name": "Sync Conflicts"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "shynkro.actionsView",
+        "contents": "Start or join a collaborative workspace.\n[$(add) Init Workspace](command:shynkro.init)\n[$(cloud-download) Clone Workspace](command:shynkro.clone)\n[$(plug) Join by ID](command:shynkro.join)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)",
+        "when": "!shynkro.syncActive"
+      },
+      {
+        "view": "shynkro.actionsView",
+        "contents": "Workspace is active.\n[$(share) Share Workspace](command:shynkro.shareWorkspace)\n[$(warning) Resolve Sync Issues](command:shynkro.resolveSyncIssues)\n[$(clippy) Copy Workspace ID](command:shynkro.copyWorkspaceId)\n[$(person-add) Invite Member](command:shynkro.invite)\n[$(debug-disconnect) Re-link Workspace](command:shynkro.relink)\n[$(trash) Delete Workspace](command:shynkro.deleteWorkspace)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)\n[$(sign-out) Logout](command:shynkro.logout)",
+        "when": "shynkro.syncActive"
+      }
+    ],
+    "configuration": {
+      "title": "Shynkro",
+      "properties": {
+        "shynkro.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:3000",
+          "description": "Shynkro server URL"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -watch -p tsconfig.json",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@shynkro/shared": "workspace:*",
+    "undici": "^7.24.6",
+    "yjs": "^13.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^6.0.2"
+  }
+}

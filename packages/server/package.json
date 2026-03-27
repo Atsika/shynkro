@@ -1,0 +1,29 @@
+{
+  "name": "@shynkro/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@elysiajs/cors": "latest",
+    "@elysiajs/jwt": "latest",
+    "@shynkro/shared": "workspace:*",
+    "argon2": "latest",
+    "drizzle-orm": "latest",
+    "elysia": "latest",
+    "fflate": "^0.8.2",
+    "jose": "^6.2.2",
+    "yjs": "latest"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "drizzle-kit": "latest",
+    "postgres": "^3.4.8"
+  }
+}

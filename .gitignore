@@ -1,0 +1,10 @@
+node_modules/
+out/
+*.vsix
+.env
+blobs/
+*.db
+*.db-shm
+*.db-wal
+dist/
+.shynkro/
