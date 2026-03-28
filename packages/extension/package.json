@@ -194,9 +194,10 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p tsconfig.json",
-    "watch": "tsc -watch -p tsconfig.json",
-    "package": "vsce package --no-dependencies"
+    "compile": "rm -rf out && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "bun run compile && vsce package --no-dependencies"
   },
   "dependencies": {
     "@shynkro/shared": "workspace:*",
@@ -207,6 +208,7 @@
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.27.4",
     "typescript": "^6.0.2"
   }
 }
