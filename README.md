@@ -20,16 +20,16 @@ Shynkro lets multiple users edit the same folder in real time. Every participant
 
 ```
 ┌─────────────────────┐        REST + WebSocket        ┌──────────────────────┐
-│   VS Code Extension │ ◄──────────────────────────── │   Bun / Elysia Server │
-│   (local mirror)    │                                │   PostgreSQL + blobs  │
+│   VS Code Extension │ ◄───────────────────────────── │  Bun / Elysia Server │
+│   (local mirror)    │                                │  PostgreSQL + blobs  │
 └─────────────────────┘                                └──────────────────────┘
 ```
 
-| Package | Role |
-|---------|------|
-| `packages/server` | Elysia HTTP + WebSocket server, Drizzle ORM, Yjs persistence |
+| Package              | Role                                                             |
+| -------------------- | ---------------------------------------------------------------- |
+| `packages/server`    | Elysia HTTP + WebSocket server, Drizzle ORM, Yjs persistence     |
 | `packages/extension` | VS Code extension — file sync, Yjs bridge, presence, conflict UI |
-| `packages/shared` | TypeScript types shared between server and extension |
+| `packages/shared`    | TypeScript types shared between server and extension             |
 
 ---
 
@@ -65,13 +65,13 @@ The server listens on `http://localhost:3000` by default.
 
 ### Environment variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | — |
-| `JWT_SECRET` | Secret for signing access tokens | — |
-| `REFRESH_TOKEN_SECRET` | Secret for signing refresh tokens | — |
-| `SHYNKRO_BLOB_DIR` | Directory for binary file storage | `./blobs` |
-| `PORT` | HTTP port | `3000` |
+| Variable               | Description                       | Default   |
+| ---------------------- | --------------------------------- | --------- |
+| `DATABASE_URL`         | PostgreSQL connection string      | —         |
+| `JWT_SECRET`           | Secret for signing access tokens  | —         |
+| `REFRESH_TOKEN_SECRET` | Secret for signing refresh tokens | —         |
+| `SHYNKRO_BLOB_DIR`     | Directory for binary file storage | `./blobs` |
+| `PORT`                 | HTTP port                         | `3000`    |
 
 ---
 
@@ -119,11 +119,11 @@ Run **Shynkro: Share Workspace** to copy the workspace ID or invite a member by 
 
 ### Roles
 
-| Role | Can edit | Can invite |
-|------|----------|------------|
-| Owner | Yes | Yes |
-| Editor | Yes | No |
-| Viewer | No (read-only) | No |
+| Role   | Can edit       | Can invite |
+| ------ | -------------- | ---------- |
+| Owner  | Yes            | Yes        |
+| Editor | Yes            | No         |
+| Viewer | No (read-only) | No         |
 
 ---
 
@@ -146,24 +146,24 @@ Run **Shynkro: Share Workspace** to copy the workspace ID or invite a member by 
 
 Base URL: `http://localhost:3000/api/v1`
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/auth/register` | Create account |
-| `POST` | `/auth/login` | Log in, receive tokens |
-| `POST` | `/auth/refresh` | Refresh access token |
-| `GET` | `/workspaces` | List joined workspaces |
-| `POST` | `/workspaces` | Create workspace |
-| `GET` | `/workspaces/:id` | Get workspace info |
-| `PATCH` | `/workspaces/:id` | Rename workspace |
-| `DELETE` | `/workspaces/:id` | Delete workspace |
-| `GET` | `/workspaces/:id/export` | Download workspace as ZIP |
-| `GET` | `/workspaces/:id/changes?since=` | Incremental change log |
-| `GET` | `/workspaces/:id/tree` | File tree |
-| `GET` | `/workspaces/files/:id` | Get file content |
-| `POST` | `/workspaces/:id/files` | Create file |
-| `PATCH` | `/workspaces/:id/files/:id` | Rename file |
-| `DELETE` | `/workspaces/:id/files/:id` | Delete file |
-| `GET /WS` | `/realtime` | WebSocket — Yjs + presence |
+| Method    | Path                             | Description                |
+| --------- | -------------------------------- | -------------------------- |
+| `POST`    | `/auth/register`                 | Create account             |
+| `POST`    | `/auth/login`                    | Log in, receive tokens     |
+| `POST`    | `/auth/refresh`                  | Refresh access token       |
+| `GET`     | `/workspaces`                    | List joined workspaces     |
+| `POST`    | `/workspaces`                    | Create workspace           |
+| `GET`     | `/workspaces/:id`                | Get workspace info         |
+| `PATCH`   | `/workspaces/:id`                | Rename workspace           |
+| `DELETE`  | `/workspaces/:id`                | Delete workspace           |
+| `GET`     | `/workspaces/:id/export`         | Download workspace as ZIP  |
+| `GET`     | `/workspaces/:id/changes?since=` | Incremental change log     |
+| `GET`     | `/workspaces/:id/tree`           | File tree                  |
+| `GET`     | `/workspaces/files/:id`          | Get file content           |
+| `POST`    | `/workspaces/:id/files`          | Create file                |
+| `PATCH`   | `/workspaces/:id/files/:id`      | Rename file                |
+| `DELETE`  | `/workspaces/:id/files/:id`      | Delete file                |
+| `GET /WS` | `/realtime`                      | WebSocket — Yjs + presence |
 
 ---
 
