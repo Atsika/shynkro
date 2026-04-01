@@ -1,19 +1,21 @@
 {
   "name": "shynkro",
   "displayName": "Shynkro",
-  "description": "Collaborative workspace for VS Code",
-  "version": "0.1.0",
+  "description": "Real-time collaborative workspace synchronization",
+  "version": "0.1.1",
   "publisher": "atsika",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/atsika/shynkro.git"
   },
+  "icon": "media/logo.png",
   "private": true,
   "engines": {
     "vscode": "^1.89.0"
   },
-  "categories": ["Other"],
+  "categories": ["Other", "SCM Providers"],
+  "keywords": ["sync", "collaboration", "real-time", "workspace", "pair programming", "yjs"],
   "activationEvents": [
     "workspaceContains:.shynkro/project.json",
     "onCommand:shynkro.init",
@@ -27,9 +29,7 @@
     "onView:shynkro.presenceView",
     "onView:shynkro.actionsView",
     "onView:shynkro.conflictView",
-    "onCommand:shynkro.setServerUrl",
-    "onCommand:shynkro.resolveSyncIssues",
-    "onCommand:shynkro.shareWorkspace"
+    "onCommand:shynkro.setServerUrl"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -103,12 +103,26 @@
         "title": "Unfollow"
       },
       {
-        "command": "shynkro.resolveSyncIssues",
-        "title": "Shynkro: Resolve Sync Issues"
+        "command": "shynkro.acceptLocalHunk",
+        "title": "Shynkro: Accept My Changes"
       },
       {
-        "command": "shynkro.shareWorkspace",
-        "title": "Shynkro: Share Workspace"
+        "command": "shynkro.acceptServerHunk",
+        "title": "Shynkro: Accept Server's Changes"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "shynkro.acceptLocalHunk",
+        "key": "ctrl+shift+y",
+        "mac": "cmd+shift+y",
+        "when": "shynkro.hasActiveConflict"
+      },
+      {
+        "command": "shynkro.acceptServerHunk",
+        "key": "ctrl+shift+n",
+        "mac": "cmd+shift+n",
+        "when": "shynkro.hasActiveConflict"
       }
     ],
     "menus": {
@@ -150,7 +164,7 @@
         {
           "id": "shynkro-sidebar",
           "title": "Shynkro",
-          "icon": "$(sync)"
+          "icon": "media/sidebar-icon.svg"
         }
       ]
     },
@@ -178,7 +192,7 @@
       },
       {
         "view": "shynkro.actionsView",
-        "contents": "Workspace is active.\n[$(share) Share Workspace](command:shynkro.shareWorkspace)\n[$(warning) Resolve Sync Issues](command:shynkro.resolveSyncIssues)\n[$(clippy) Copy Workspace ID](command:shynkro.copyWorkspaceId)\n[$(person-add) Invite Member](command:shynkro.invite)\n[$(debug-disconnect) Re-link Workspace](command:shynkro.relink)\n[$(trash) Delete Workspace](command:shynkro.deleteWorkspace)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)\n[$(sign-out) Logout](command:shynkro.logout)",
+        "contents": "Workspace is active.\n[$(clippy) Copy Workspace ID](command:shynkro.copyWorkspaceId)\n[$(person-add) Invite Member](command:shynkro.invite)\n[$(debug-disconnect) Re-link Workspace](command:shynkro.relink)\n[$(trash) Delete Workspace](command:shynkro.deleteWorkspace)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)\n[$(sign-out) Logout](command:shynkro.logout)",
         "when": "shynkro.syncActive"
       }
     ],

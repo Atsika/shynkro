@@ -354,8 +354,11 @@ export class YjsBridge {
         if (isInitialState) {
           if (entry.pendingConflict) {
             if (entry.conflictServerDoc) {
-              // Active conflict with a tracking doc — absorb the new server state.
+              // Active conflict with a tracking doc — absorb the new server state and live-update the UI.
               Y.applyUpdate(entry.conflictServerDoc, frame.data, "remote")
+              const newServerText = entry.conflictServerDoc.getText("content").toString()
+              entry.conflictOriginalServerText = newServerText
+              this.conflictManager.updateServerText(frame.docId, newServerText).catch(() => {})
               log.appendLine(`[yjsBridge] updated conflictServerDoc from WS_BINARY_YJS_STATE for ${path.basename(entry.filePath)}`)
               return
             }
@@ -403,9 +406,12 @@ export class YjsBridge {
           // Incremental update — apply and push to editor
           const before = entry.yDoc.getText("content").toString()
           Y.applyUpdate(entry.yDoc, frame.data, "remote")
-          // Keep the conflict shadow doc in sync so resolution uses the latest server state
+          // Keep the conflict shadow doc in sync and live-update the conflict UI
           if (entry.pendingConflict && entry.conflictServerDoc) {
             Y.applyUpdate(entry.conflictServerDoc, frame.data, "remote")
+            const newServerText = entry.conflictServerDoc.getText("content").toString()
+            entry.conflictOriginalServerText = newServerText
+            this.conflictManager.updateServerText(frame.docId, newServerText).catch(() => {})
           }
           const after = entry.yDoc.getText("content").toString()
           if (before !== after) {

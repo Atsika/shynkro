@@ -26,6 +26,8 @@ import { PresenceView, PresenceItem } from "./views/presenceView"
 import { ActionsView } from "./views/actionsView"
 import { ConflictView } from "./views/conflictView"
 import { ConflictManager } from "./conflict/conflictManager"
+import { ConflictDecorations } from "./conflict/conflictDecorations"
+import { ConflictLensProvider } from "./conflict/conflictLens"
 import { SHYNKRO_DIR, PROJECT_JSON, EXTENSION_VERSION } from "./constants"
 
 let stateDb: StateDb | null = null
@@ -294,27 +296,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("shynkro.resolveSyncIssues", async () => {
-      if (!conflictManager || conflictManager.count === 0) {
-        vscode.window.showInformationMessage("Shynkro: No sync conflicts detected")
-        return
+    vscode.commands.registerCommand("shynkro.acceptLocalHunk", (docId?: string, hunkIndex?: number) => {
+      if (docId != null && hunkIndex != null) {
+        conflictManager?.resolveHunk(docId, hunkIndex, "local")
+      } else {
+        conflictManager?.resolveHunkAtCursor(docId, "local")
       }
-      vscode.commands.executeCommand("shynkro.conflictView.focus")
-      vscode.window.showWarningMessage(`Shynkro: ${conflictManager.count} conflict(s) — resolve them in the Sync Conflicts panel`)
     }),
 
-    vscode.commands.registerCommand("shynkro.shareWorkspace", async () => {
-      const found = findProjectConfig()
-      if (!found) {
-        vscode.window.showErrorMessage("Shynkro: no active workspace — init or clone a workspace first")
-        return
-      }
-      const pick = await vscode.window.showQuickPick(["Copy Workspace ID", "Invite a Member"])
-      if (pick === "Copy Workspace ID") {
-        await vscode.env.clipboard.writeText(found.config.workspaceId)
-        vscode.window.showInformationMessage("Shynkro: Workspace ID copied!")
-      } else if (pick === "Invite a Member") {
-        await executeInvite(found.config.workspaceId, restClient)
+    vscode.commands.registerCommand("shynkro.acceptServerHunk", (docId?: string, hunkIndex?: number) => {
+      if (docId != null && hunkIndex != null) {
+        conflictManager?.resolveHunk(docId, hunkIndex, "server")
+      } else {
+        conflictManager?.resolveHunkAtCursor(docId, "server")
       }
     }),
 
@@ -461,13 +455,24 @@ async function startSync(
     binarySync
   )
 
-  conflictManager = new ConflictManager((n) => statusBar?.setConflicts(n))
+  const conflictDecorations = new ConflictDecorations()
+  const conflictLensProvider = new ConflictLensProvider()
+  conflictManager = new ConflictManager(
+    (n) => {
+      statusBar?.setConflicts(n)
+      vscode.commands.executeCommand("setContext", "shynkro.hasActiveConflict", n > 0)
+    },
+    conflictDecorations,
+    conflictLensProvider
+  )
   yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager)
 
   // Register conflict view now that conflictManager is available
   conflictView?.dispose()
   conflictView = new ConflictView(conflictManager)
   context.subscriptions.push(
+    conflictDecorations,
+    vscode.languages.registerCodeLensProvider({ scheme: "file" }, conflictLensProvider),
     vscode.window.registerTreeDataProvider("shynkro.conflictView", conflictView)
   )
 

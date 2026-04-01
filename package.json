@@ -1,5 +1,6 @@
 {
   "name": "shynkro",
+  "description": "Real-time collaborative workspace synchronization",
   "private": true,
   "license": "MIT",
   "repository": {

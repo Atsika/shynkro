@@ -12,6 +12,19 @@ export interface DiffHunk {
   serverLines: string[]
 }
 
+export interface ConflictHunkMeta {
+  hunkIndex: number
+  /** Line range in the output buffer for local (mine) lines — [start, end) */
+  localRange: { start: number; end: number }
+  /** Line range in the output buffer for server (theirs) lines — [start, end) */
+  serverRange: { start: number; end: number }
+}
+
+export interface ConflictBuildResult {
+  text: string
+  hunks: ConflictHunkMeta[]
+}
+
 /** Files larger than this threshold fall back to a single whole-file conflict block. */
 const MAX_LINES_FOR_LCS = 1500
 
@@ -33,27 +46,39 @@ export function computeHunks(localText: string, serverText: string): DiffHunk[] 
 }
 
 /**
- * Build the conflict-marker text that VS Code's merge-conflict extension renders inline.
- * Unchanged lines are kept as-is; each hunk is wrapped in <<<<<<< / ======= / >>>>>>> markers.
+ * Build interleaved conflict text with hunk position metadata.
+ * Each conflict hunk is rendered as: [local lines] [\u200B separator] [server lines].
+ * Unchanged lines appear as-is between hunks.
  */
-export function buildConflictText(localText: string, serverText: string): string {
+export function buildConflictText(localText: string, serverText: string): ConflictBuildResult {
   const a = localText.split("\n")
   const hunks = computeHunks(localText, serverText)
 
-  if (hunks.length === 0) return localText
+  if (hunks.length === 0) return { text: localText, hunks: [] }
 
   const out: string[] = []
+  const meta: ConflictHunkMeta[] = []
   let ai = 0
 
-  for (const hunk of hunks) {
+  for (let hi = 0; hi < hunks.length; hi++) {
+    const hunk = hunks[hi]
+
     // Unchanged lines before this hunk
     while (ai < hunk.localStart) out.push(a[ai++])
 
-    out.push("<<<<<<< Local (your offline changes)")
+    const localStart = out.length
     for (let i = hunk.localStart; i < hunk.localEnd; i++) out.push(a[i])
-    out.push("=======")
+    const localEnd = out.length
+
+    const serverStart = out.length
     for (const line of hunk.serverLines) out.push(line)
-    out.push(">>>>>>> Remote (server state)")
+    const serverEnd = out.length
+
+    meta.push({
+      hunkIndex: hi,
+      localRange: { start: localStart, end: localEnd },
+      serverRange: { start: serverStart, end: serverEnd },
+    })
 
     ai = hunk.localEnd
   }
@@ -61,7 +86,7 @@ export function buildConflictText(localText: string, serverText: string): string
   // Remaining unchanged lines
   while (ai < a.length) out.push(a[ai++])
 
-  return out.join("\n")
+  return { text: out.join("\n"), hunks: meta }
 }
 
 // ---------------------------------------------------------------------------

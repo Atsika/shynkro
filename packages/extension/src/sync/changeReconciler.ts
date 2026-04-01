@@ -184,7 +184,29 @@ export class ChangeReconciler {
     const localPath = safeJoin(this.workspaceRoot, row.path)
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${row.path}`); return }
     try {
-      await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+      // If local file was also modified since last sync, ask the user which version to keep.
+      let localChanged = false
+      if (row.binaryHash && fs.existsSync(localPath)) {
+        const localHash = await this.binarySync.computeHash(localPath)
+        localChanged = localHash !== row.binaryHash
+      }
+
+      if (localChanged) {
+        const fileName = path.basename(row.path)
+        const choice = await vscode.window.showWarningMessage(
+          `Shynkro: "${fileName}" was modified both locally and on the server.`,
+          "Keep Mine",
+          "Keep Server's"
+        )
+        if (choice === "Keep Mine") {
+          await this.binarySync.upload(msg.fileId as FileId, localPath, this.workspaceId)
+        } else {
+          await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+        }
+      } else {
+        await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+      }
+
       this.stateDb.setRevision(this.workspaceId, msg.revision)
     } catch (err) {
       log.appendLine(`[reconciler] applyBinaryUpdated error for ${row.path}: ${err}`)

@@ -9,13 +9,16 @@ import { blobRoutes } from "./routes/blobs.js"
 import { memberRoutes } from "./routes/members.js"
 import { realtimeRoutes } from "./routes/realtime.js"
 import { expireImportSessions } from "./jobs/expireImportSessions.js"
+import { pruneChangeLogs } from "./jobs/pruneChangeLogs.js"
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10)
 
 // Run startup jobs
 await expireImportSessions()
+await pruneChangeLogs()
 setInterval(() => {
   expireImportSessions().catch(console.error)
+  pruneChangeLogs().catch(console.error)
 }, 5 * 60 * 1000)
 
 const app = new Elysia()
