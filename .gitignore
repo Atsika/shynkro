@@ -3,6 +3,7 @@ out/
 *.vsix
 .env
 blobs/
+data/
 *.db
 *.db-shm
 *.db-wal

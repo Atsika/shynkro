@@ -107,3 +107,16 @@ export function sendToUser(workspaceId: string, userId: string, message: ServerM
     if (ctx.userId === userId) ctx.ws.send(payload)
   }
 }
+
+export function closeAllConnections(): void {
+  const seen = new Set<WsContext>()
+  for (const clients of workspaceClients.values()) {
+    for (const ctx of clients) {
+      if (seen.has(ctx)) continue
+      seen.add(ctx)
+      try { ctx.ws.close(1001, "Server shutting down") } catch {}
+    }
+  }
+  workspaceClients.clear()
+  docClients.clear()
+}

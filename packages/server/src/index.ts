@@ -7,9 +7,12 @@ import { fileRoutes } from "./routes/files.js"
 import { blobRoutes } from "./routes/blobs.js"
 import { memberRoutes } from "./routes/members.js"
 import { realtimeRoutes } from "./routes/realtime.js"
-import { runMigrations } from "./db/index.js"
+import { runMigrations, closeDb } from "./db/index.js"
 import { expireImportSessions } from "./jobs/expireImportSessions.js"
 import { pruneChangeLogs } from "./jobs/pruneChangeLogs.js"
+import { closeAllConnections } from "./services/realtimeState.js"
+import { setupGracefulShutdown } from "./lib/shutdown.js"
+import { logger } from "./lib/logger.js"
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10)
 
@@ -17,9 +20,9 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10)
 await runMigrations()
 await expireImportSessions()
 await pruneChangeLogs()
-setInterval(() => {
-  expireImportSessions().catch(console.error)
-  pruneChangeLogs().catch(console.error)
+const jobInterval = setInterval(() => {
+  expireImportSessions().catch((err) => logger.error("expireImportSessions failed", { err: String(err) }))
+  pruneChangeLogs().catch((err) => logger.error("pruneChangeLogs failed", { err: String(err) }))
 }, 5 * 60 * 1000)
 
 const app = new Elysia()
@@ -40,10 +43,17 @@ const app = new Elysia()
       set.status = 400
       return { message: "Validation error", details: error.message }
     }
-    console.error("[server] Unhandled error:", error)
+    logger.error("unhandled error", { code, err: String(error) })
     set.status = 500
     return { message: "Internal server error" }
   })
   .listen(PORT)
 
-console.log(`Shynkro server running on http://localhost:${PORT}`)
+setupGracefulShutdown({
+  server: app.server!,
+  intervals: [jobInterval],
+  closeAllConnections,
+  closeDb,
+})
+
+logger.info("server started", { port: PORT })

@@ -15,6 +15,7 @@ import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { requireMember } from "../lib/authz.js"
 import { recordChange } from "../lib/changeLog.js"
 import { createStorageBackend } from "../storage/index.js"
+import { logger } from "../lib/logger.js"
 
 const storage = createStorageBackend()
 
@@ -228,7 +229,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
     // Clean up blob from storage (best-effort, after successful DB update)
     if (file.binaryHash) {
       storage.delete(file.binaryHash).catch((err) =>
-        console.error(`[files] blob cleanup failed for ${file.binaryHash}:`, err)
+        logger.error("blob cleanup failed", { hash: file.binaryHash, err: String(err) })
       )
     }
 

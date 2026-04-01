@@ -2,6 +2,7 @@ import * as Y from "yjs"
 import { eq, sql } from "drizzle-orm"
 import { db } from "../db/index.js"
 import { collaborativeDocs, yjsUpdates } from "../db/schema.js"
+import { logger } from "../lib/logger.js"
 
 const COMPACTION_THRESHOLD = 500
 
@@ -21,7 +22,7 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
     try {
       Y.applyUpdate(doc, docRow.snapshot)
     } catch (err) {
-      console.error(`[yjs] Snapshot corrupt for doc ${docId}:`, err)
+      logger.error("snapshot corrupt", { docId, err: String(err) })
       // Return empty doc — critical but recoverable
       return new Y.Doc()
     }
@@ -38,7 +39,7 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
     try {
       Y.applyUpdate(doc, update.data)
     } catch (err) {
-      console.error(`[yjs] Update ${update.id} corrupt for doc ${docId}:`, err)
+      logger.error("update corrupt", { docId, updateId: update.id, err: String(err) })
     }
   }
 
@@ -77,7 +78,7 @@ export async function maybeCompact(docId: string): Promise<void> {
       await tx.delete(yjsUpdates).where(eq(yjsUpdates.docId, docId))
     })
   } catch (err) {
-    console.error(`[yjs] Compaction failed for doc ${docId}:`, err)
+    logger.error("compaction failed", { docId, err: String(err) })
   }
 }
 

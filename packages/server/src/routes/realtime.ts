@@ -28,6 +28,7 @@ import {
   type ClientMessage,
 } from "@shynkro/shared"
 import { getUserById } from "../services/authService.js"
+import { logger } from "../lib/logger.js"
 
 const TOKEN_EXPIRY_WARNING_SECS = 60
 
@@ -64,11 +65,11 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         try {
           await persistUpdate(docId, update)
         } catch (err) {
-          console.error(`[ws] persistUpdate failed for doc ${docId}:`, err)
+          logger.error("persistUpdate failed", { docId, err: String(err) })
           return
         }
         broadcastToDoc(docId, buf, ctx)
-        maybeCompact(docId).catch(console.error)
+        maybeCompact(docId).catch((err) => logger.error("compaction failed", { docId, err: String(err) }))
       }
       return
     }
@@ -249,10 +250,10 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         frame[0] = WS_BINARY_YJS_STATE
         frame.set(docIdBytes, 1)
         frame.set(state, 17)
-        console.log(`[ws] sending state frame docId=${msg.docId.slice(0,8)} size=${frame.length}`)
+        logger.debug("sending state frame", { docId: msg.docId, size: frame.length })
         ws.raw.send(frame)
       } catch (err) {
-        console.error(`[ws] Failed to send doc state for ${msg.docId}:`, err)
+        logger.error("failed to send doc state", { docId: msg.docId, err: String(err) })
       }
       return
     }

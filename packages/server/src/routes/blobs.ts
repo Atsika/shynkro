@@ -7,6 +7,7 @@ import { createStorageBackend } from "../storage/index.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
 import { requireMember } from "../lib/authz.js"
 import { recordChange } from "../lib/changeLog.js"
+import { logger } from "../lib/logger.js"
 
 const storage = createStorageBackend()
 
@@ -58,7 +59,7 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     // Clean up old blob (best-effort, after successful DB update)
     if (oldHash && oldHash !== hash) {
       storage.delete(oldHash).catch((err) =>
-        console.error(`[blobs] old blob cleanup failed for ${oldHash}:`, err)
+        logger.error("old blob cleanup failed", { hash: oldHash, err: String(err) })
       )
     }
 

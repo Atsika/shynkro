@@ -1,5 +1,5 @@
 import Elysia, { t, status } from "elysia"
-import { eq, and, sql } from "drizzle-orm"
+import { eq, and, sql, count } from "drizzle-orm"
 import { db } from "../db/index.js"
 import {
   collaborativeDocs,
@@ -18,6 +18,7 @@ import { requireMember } from "../lib/authz.js"
 const storage = createStorageBackend()
 
 const IMPORT_SESSION_TTL_MINUTES = 30
+const MAX_IMPORT_FILES = 5000
 
 export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import" })
   .use(withAuth)
@@ -66,6 +67,15 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
       }
 
       if (!isValidFilePath(body.path)) return status(400, { message: "Invalid file path" })
+
+      const [{ value: fileCount }] = await db
+        .select({ value: count() })
+        .from(importFiles)
+        .where(eq(importFiles.sessionId, params.importId))
+
+      if (fileCount >= MAX_IMPORT_FILES) {
+        return status(400, { message: `Import session cannot exceed ${MAX_IMPORT_FILES} files` })
+      }
 
       const fileId = uuid()
       // Upsert by path (idempotent)
