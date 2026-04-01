@@ -1,4 +1,3 @@
-import * as argon2 from "argon2"
 import { eq, and, gt } from "drizzle-orm"
 import { db } from "../db/index.js"
 import { refreshTokens, users } from "../db/schema.js"
@@ -7,11 +6,11 @@ import { randomId, now } from "../utils.js"
 const REFRESH_TOKEN_TTL_DAYS = 30
 
 export async function hashPassword(password: string): Promise<string> {
-  return argon2.hash(password, { type: argon2.argon2id })
+  return Bun.password.hash(password, { algorithm: "argon2id" })
 }
 
 export async function verifyPassword(hash: string, password: string): Promise<boolean> {
-  return argon2.verify(hash, password)
+  return Bun.password.verify(password, hash)
 }
 
 export async function createRefreshToken(userId: string): Promise<string> {

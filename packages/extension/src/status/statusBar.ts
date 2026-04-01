@@ -24,16 +24,13 @@ export class StatusBar {
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100)
     this.item.name = "Shynkro"
-    this.item.command = {
-      command: "workbench.action.quickOpen",
-      title: "Shynkro commands",
-      arguments: [">Shynkro "],
-    }
+    this.item.command = "shynkro.actionsView.focus"
     this.setStatus("idle")
     this.item.show()
 
     this.conflictItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99)
     this.conflictItem.name = "Shynkro Conflicts"
+    this.conflictItem.command = "shynkro.conflictView.focus"
     this.conflictItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground")
   }
 

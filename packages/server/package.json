@@ -12,10 +12,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
-    "@elysiajs/cors": "latest",
-    "@elysiajs/jwt": "latest",
     "@shynkro/shared": "workspace:*",
-    "argon2": "latest",
     "drizzle-orm": "latest",
     "elysia": "latest",
     "fflate": "^0.8.2",

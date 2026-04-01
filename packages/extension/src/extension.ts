@@ -110,21 +110,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
       const ok = await authService!.login(serverUrl)
-      if (ok) vscode.window.showInformationMessage("Shynkro: logged in")
+      if (ok) {
+        vscode.window.showInformationMessage("Shynkro: logged in")
+        const found = findProjectConfig()
+        if (found) {
+          restClient.setBaseUrl(found.config.serverUrl)
+          startSync(found.config.serverUrl, restClient, tokenStore, context).catch(() => {})
+        }
+      }
     }),
 
     vscode.commands.registerCommand("shynkro.register", async () => {
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
       const ok = await authService!.register(serverUrl)
-      if (ok) vscode.window.showInformationMessage("Shynkro: registered and logged in")
+      if (ok) {
+        vscode.window.showInformationMessage("Shynkro: registered and logged in")
+        const found = findProjectConfig()
+        if (found) {
+          restClient.setBaseUrl(found.config.serverUrl)
+          startSync(found.config.serverUrl, restClient, tokenStore, context).catch(() => {})
+        }
+      }
     }),
 
     vscode.commands.registerCommand("shynkro.logout", async () => {
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       await authService!.logout(serverUrl)
-      wsManager?.disconnect()
-      statusBar?.setStatus("idle")
+      stopSync()
       vscode.window.showInformationMessage("Shynkro: logged out")
     }),
 
@@ -465,7 +478,7 @@ async function startSync(
     conflictDecorations,
     conflictLensProvider
   )
-  yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager)
+  yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager, stateDb, workspaceRoot)
 
   // Register conflict view now that conflictManager is available
   conflictView?.dispose()

@@ -11,9 +11,5 @@
   "scripts": {
     "dev:server": "bun run --cwd packages/server dev",
     "build": "bun run --cwd packages/shared build && bun run --cwd packages/server build"
-  },
-  "dependencies": {
-    "@types/bun": "^1.3.11",
-    "yjs": "^13.6.0"
   }
 }

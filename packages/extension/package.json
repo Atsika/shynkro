@@ -2,7 +2,7 @@
   "name": "shynkro",
   "displayName": "Shynkro",
   "description": "Real-time collaborative workspace synchronization",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "publisher": "atsika",
   "license": "MIT",
   "repository": {
@@ -12,7 +12,7 @@
   "icon": "media/logo.png",
   "private": true,
   "engines": {
-    "vscode": "^1.89.0"
+    "vscode": "^1.100.0"
   },
   "categories": ["Other", "SCM Providers"],
   "keywords": ["sync", "collaboration", "real-time", "workspace", "pair programming", "yjs"],
@@ -187,7 +187,7 @@
     "viewsWelcome": [
       {
         "view": "shynkro.actionsView",
-        "contents": "Start or join a collaborative workspace.\n[$(add) Init Workspace](command:shynkro.init)\n[$(cloud-download) Clone Workspace](command:shynkro.clone)\n[$(plug) Join by ID](command:shynkro.join)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)",
+        "contents": "Start or join a collaborative workspace.\n[$(sign-in) Login](command:shynkro.login)\n[$(add) Init Workspace](command:shynkro.init)\n[$(cloud-download) Clone Workspace](command:shynkro.clone)\n[$(plug) Join by ID](command:shynkro.join)\n[$(settings) Set Server URL](command:shynkro.setServerUrl)",
         "when": "!shynkro.syncActive"
       },
       {
@@ -208,21 +208,18 @@
     }
   },
   "scripts": {
-    "compile": "rm -rf out && node esbuild.mjs",
-    "watch": "node esbuild.mjs --watch",
+    "compile": "rm -rf out && bun build src/extension.ts --outdir out --bundle --target=node --format=cjs --external=vscode --sourcemap=external",
     "typecheck": "tsc --noEmit",
     "package": "bun run compile && vsce package --no-dependencies"
   },
   "dependencies": {
     "@shynkro/shared": "workspace:*",
-    "undici": "^7.24.6",
     "yjs": "^13.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.7.1",
-    "esbuild": "^0.27.4",
     "typescript": "^6.0.2"
   }
 }

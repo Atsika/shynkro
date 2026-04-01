@@ -36,16 +36,6 @@ export class StateDb {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `)
-    // Add the deleted column to existing databases that predate this migration.
-    // SQLite does not support ADD COLUMN IF NOT EXISTS, so we swallow the error when
-    // the column already exists.
-    try {
-      this.db.exec("ALTER TABLE file_map ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
-    } catch {
-      // Column already present — nothing to do.
-    }
-    // Drop the now-redundant deleted_paths table if it exists from a previous version.
-    this.db.exec("DROP TABLE IF EXISTS deleted_paths")
   }
 
   getRevision(workspaceId: string): number {

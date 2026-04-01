@@ -84,7 +84,9 @@ export class YjsBridge {
   constructor(
     private readonly wsManager: WsManager,
     private readonly fileWatcher: FileWatcher,
-    private readonly conflictManager: ConflictManager
+    private readonly conflictManager: ConflictManager,
+    private readonly stateDb: import("../state/stateDb").StateDb,
+    private readonly workspaceRoot: string
   ) {
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.handleBinaryFrame(frame)),
@@ -94,6 +96,8 @@ export class YjsBridge {
         // Viewer read-only enforcement
         if (editor && this.currentRole === "viewer" && this.isTrackedPath(editor.document.uri.fsPath)) {
           vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
+          const docEntry = [...this.docs.values()].find(e => e.editor.document === editor.document)
+          if (docEntry) this.showPermissionRequestPopup(docEntry.workspaceId)
         }
 
         // Clear cursor from the previous doc when switching files
@@ -132,6 +136,25 @@ export class YjsBridge {
       // Update editor reference in case it changed (e.g. after reload)
       existing.editor = editor
       return
+    }
+
+    // Evict stale entries for the same file path (e.g. file was deleted and recreated with a new docId)
+    for (const [oldDocId, oldEntry] of this.docs) {
+      if (oldEntry.filePath === filePath && oldDocId !== docId) {
+        log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
+        const oldHandler = this.updateHandlers.get(oldDocId)
+        if (oldHandler) { oldEntry.yDoc.off("update", oldHandler); this.updateHandlers.delete(oldDocId) }
+        oldEntry.yDoc.destroy()
+        this.docs.delete(oldDocId)
+      }
+    }
+    for (const [oldDocId, oldBg] of this.backgroundDocs) {
+      if (oldBg.filePath === filePath && oldDocId !== docId) {
+        log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
+        if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
+        oldBg.yDoc.destroy()
+        this.backgroundDocs.delete(oldDocId)
+      }
     }
 
     let yDoc: Y.Doc
@@ -194,6 +217,26 @@ export class YjsBridge {
    */
   subscribeBackground(docId: string, workspaceId: WorkspaceId, filePath: string): void {
     if (this.docs.has(docId) || this.backgroundDocs.has(docId)) return
+
+    // Evict stale entries for the same file path
+    for (const [oldDocId, oldEntry] of this.docs) {
+      if (oldEntry.filePath === filePath && oldDocId !== docId) {
+        log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
+        const oldHandler = this.updateHandlers.get(oldDocId)
+        if (oldHandler) { oldEntry.yDoc.off("update", oldHandler); this.updateHandlers.delete(oldDocId) }
+        oldEntry.yDoc.destroy()
+        this.docs.delete(oldDocId)
+      }
+    }
+    for (const [oldDocId, oldBg] of this.backgroundDocs) {
+      if (oldBg.filePath === filePath && oldDocId !== docId) {
+        log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
+        if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
+        oldBg.yDoc.destroy()
+        this.backgroundDocs.delete(oldDocId)
+      }
+    }
+
     log.appendLine(`[yjsBridge] subscribeBackground ${path.basename(filePath)}`)
     const yDoc = new Y.Doc()
     this.backgroundDocs.set(docId, { yDoc, filePath, workspaceId, writeTimer: null, hasReceivedState: false, pendingConflict: false })
@@ -416,8 +459,8 @@ export class YjsBridge {
           const after = entry.yDoc.getText("content").toString()
           if (before !== after) {
             log.appendLine(`[yjsBridge] update applied ${path.basename(entry.filePath)}: ${before.length} → ${after.length}`)
+            this.applyDocToEditor(entry)
           }
-          this.applyDocToEditor(entry)
         }
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
         // Awareness (cursor/selection) — only meaningful when doc is open in an editor
@@ -690,6 +733,13 @@ export class YjsBridge {
     if (entry.writeTimer) clearTimeout(entry.writeTimer)
     entry.writeTimer = setTimeout(() => {
       entry.writeTimer = null
+      // Don't write if the file was deleted — prevents re-creating deleted files on reconnect
+      const relPath = path.relative(this.workspaceRoot, entry.filePath).replace(/\\/g, "/")
+      if (!this.stateDb.getFileByPath(relPath)) {
+        log.appendLine(`[yjsBridge] skipping background write for deleted file ${path.basename(entry.filePath)}`)
+        this.backgroundDocs.delete(docId)
+        return
+      }
       const text = entry.yDoc.getText("content").toString()
       try {
         fs.mkdirSync(path.dirname(entry.filePath), { recursive: true })
@@ -809,6 +859,7 @@ export class YjsBridge {
           if (change.text) yText.insert(change.rangeOffset, change.text)
         }
       })
+      return // Only apply to the first matching doc entry
     }
   }
 

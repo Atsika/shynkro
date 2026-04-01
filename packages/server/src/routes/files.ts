@@ -11,9 +11,12 @@ import { withAuth } from "../middleware/auth.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
 import { getPlainText, prepareDocUpdate } from "../services/yjsService.js"
 import { uuid, isValidFilePath } from "../utils.js"
-import { classifyFile } from "../fileClassifier.js"
+import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { requireMember } from "../lib/authz.js"
 import { recordChange } from "../lib/changeLog.js"
+import { createStorageBackend } from "../storage/index.js"
+
+const storage = createStorageBackend()
 
 async function incrementRevision(workspaceId: string, tx?: Parameters<Parameters<typeof db.transaction>[0]>[0]): Promise<number> {
   const executor = tx ?? db
@@ -50,7 +53,9 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       if (existing) return status(409, { message: "Path already exists" })
 
       const fileId = uuid()
-      const kind = body.kind ?? classifyFile(body.path)
+      const kind = body.kind
+        ?? classifyFile(body.path)
+        ?? (body.content ? classifyFileWithContent(body.path, Buffer.from(body.content)) : "text")
       let docId: string | undefined
 
       if (kind === "text") {
@@ -173,12 +178,14 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
       const oldPath = file.path
 
-      await db
-        .update(fileEntries)
-        .set({ path: body.path, updatedAt: new Date() })
-        .where(eq(fileEntries.id, params.fileId))
-
-      const revision = await incrementRevision(params.id)
+      let revision!: number
+      await db.transaction(async (tx) => {
+        await tx
+          .update(fileEntries)
+          .set({ path: body.path, updatedAt: new Date() })
+          .where(eq(fileEntries.id, params.fileId))
+        revision = await incrementRevision(params.id, tx)
+      })
 
       broadcastToWorkspace(params.id, {
         type: "fileRenamed",
@@ -209,12 +216,21 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
     if (!file) return status(404, { message: "File not found" })
 
-    await db
-      .update(fileEntries)
-      .set({ deleted: true, updatedAt: new Date() })
-      .where(eq(fileEntries.id, params.fileId))
+    let revision!: number
+    await db.transaction(async (tx) => {
+      await tx
+        .update(fileEntries)
+        .set({ deleted: true, updatedAt: new Date() })
+        .where(eq(fileEntries.id, params.fileId))
+      revision = await incrementRevision(params.id, tx)
+    })
 
-    const revision = await incrementRevision(params.id)
+    // Clean up blob from storage (best-effort, after successful DB update)
+    if (file.binaryHash) {
+      storage.delete(file.binaryHash).catch((err) =>
+        console.error(`[files] blob cleanup failed for ${file.binaryHash}:`, err)
+      )
+    }
 
     broadcastToWorkspace(params.id, {
       type: "fileDeleted",

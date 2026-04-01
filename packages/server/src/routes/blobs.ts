@@ -39,17 +39,28 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
       return status(400, { message: "Content hash mismatch" })
     }
 
+    const oldHash = file.binaryHash
+
     await storage.put(hash, data)
 
-    await db
-      .update(fileEntries)
-      .set({ binaryHash: hash, binarySize: data.byteLength, updatedAt: new Date() })
-      .where(eq(fileEntries.id, params.fileId))
+    let revision!: number
+    await db.transaction(async (tx) => {
+      await tx
+        .update(fileEntries)
+        .set({ binaryHash: hash, binarySize: data.byteLength, updatedAt: new Date() })
+        .where(eq(fileEntries.id, params.fileId))
+      const result = await tx.execute<{ revision: number }>(
+        sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
+      )
+      revision = result[0]!.revision
+    })
 
-    const result = await db.execute<{ revision: number }>(
-      sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
-    )
-    const revision = result[0]!.revision
+    // Clean up old blob (best-effort, after successful DB update)
+    if (oldHash && oldHash !== hash) {
+      storage.delete(oldHash).catch((err) =>
+        console.error(`[blobs] old blob cleanup failed for ${oldHash}:`, err)
+      )
+    }
 
     broadcastToWorkspace(params.id, {
       type: "binaryUpdated",

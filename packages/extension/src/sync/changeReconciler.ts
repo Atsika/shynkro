@@ -185,20 +185,29 @@ export class ChangeReconciler {
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${row.path}`); return }
     try {
       // If local file was also modified since last sync, ask the user which version to keep.
+      let localHash: string | undefined
       let localChanged = false
       if (row.binaryHash && fs.existsSync(localPath)) {
-        const localHash = await this.binarySync.computeHash(localPath)
+        localHash = await this.binarySync.computeHash(localPath)
         localChanged = localHash !== row.binaryHash
       }
 
       if (localChanged) {
+        // If local file already matches the server hash, no real conflict
+        // (e.g. both sides regenerated the same PDF from synced source files)
+        if (localHash === msg.hash) {
+          this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
+          this.stateDb.setRevision(this.workspaceId, msg.revision)
+          return
+        }
+
         const fileName = path.basename(row.path)
         const choice = await vscode.window.showWarningMessage(
           `Shynkro: "${fileName}" was modified both locally and on the server.`,
-          "Keep Mine",
-          "Keep Server's"
+          "Keep Local",
+          "Keep Server"
         )
-        if (choice === "Keep Mine") {
+        if (choice === "Keep Local") {
           await this.binarySync.upload(msg.fileId as FileId, localPath, this.workspaceId)
         } else {
           await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)

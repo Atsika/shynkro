@@ -5,7 +5,7 @@ import type { WorkspaceId } from "@shynkro/shared"
 import type { RestClient } from "../api/restClient"
 import type { StateDb } from "../state/stateDb"
 import type { WsManager } from "../ws/wsManager"
-import { classifyFile } from "../workspace/fileClassifier"
+import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { buildIgnoreMatcher } from "../ignoreUtils"
 import { ensureShynkroInGitignore } from "../workspace/gitUtils"
 import { log } from "../logger"
@@ -74,7 +74,15 @@ export class FileWatcher {
     } catch {
       return // path vanished before we could stat it
     }
-    const kind = stat.isDirectory() ? "folder" : classifyFile(uri.fsPath)
+    let kind = stat.isDirectory() ? "folder" as const : classifyFile(uri.fsPath)
+    if (kind === null) {
+      try {
+        const buf = fs.readFileSync(uri.fsPath)
+        kind = classifyFileWithContent(uri.fsPath, Buffer.from(buf))
+      } catch {
+        kind = "text"
+      }
+    }
 
     if (!this.wsManager.connected) {
       const content = kind === "text" ? fs.readFileSync(uri.fsPath, "utf-8") : undefined

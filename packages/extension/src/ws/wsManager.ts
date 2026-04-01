@@ -1,5 +1,5 @@
 import * as vscode from "vscode"
-import { WebSocket } from "undici"
+// Node 22+ has global WebSocket (stable)
 import { PROTOCOL_VERSION } from "@shynkro/shared"
 import type { ClientMessage, ServerMessage, WorkspaceId } from "@shynkro/shared"
 import {
@@ -26,6 +26,7 @@ export class WsManager {
   private pingTimer: NodeJS.Timeout | null = null
   private pongTimer: NodeJS.Timeout | null = null
   private disposed = false
+  private pendingBinaryFrames: Uint8Array[] = []
 
   private serverUrl = ""
   private workspaceId: WorkspaceId = "" as WorkspaceId
@@ -117,6 +118,11 @@ export class WsManager {
       this._onStatusChange.fire("connected")
       this.statusBar.setStatus("connected")
       this.startPing()
+      // Flush any Yjs updates that were buffered while disconnected/connecting
+      if (this.pendingBinaryFrames.length > 0) {
+        const frames = this.pendingBinaryFrames.splice(0)
+        for (const frame of frames) this.sendBinary(frame)
+      }
     } else if (msg.type === "pong") {
       if (this.pongTimer) {
         clearTimeout(this.pongTimer)
@@ -154,6 +160,9 @@ export class WsManager {
   sendBinary(frame: Uint8Array): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(frame)
+    } else {
+      // Buffer Yjs updates while disconnected/connecting — flushed on welcome
+      this.pendingBinaryFrames.push(frame)
     }
   }
 

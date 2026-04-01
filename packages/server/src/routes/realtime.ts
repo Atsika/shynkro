@@ -47,10 +47,12 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
     // Handle binary frames (Yjs updates)
     if (rawMessage instanceof Buffer || rawMessage instanceof Uint8Array) {
       const buf = rawMessage instanceof Buffer ? rawMessage : Buffer.from(rawMessage)
-      if (!ctx) return
+      if (!ctx) { ws.close(4003, "Not authenticated"); return }
 
       // Viewers may not push Yjs updates
       if (ctx.role === "viewer") return
+
+      if (buf.length < 18) return // minimum: 1 byte type + 16 bytes docId + 1 byte data
 
       const frameType = buf[0]
       if (frameType === WS_BINARY_YJS_UPDATE) {
@@ -58,8 +60,15 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         const docId = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`
         const update = buf.slice(17)
 
+        // Persist BEFORE broadcasting — if persist fails, don't broadcast a phantom update
+        try {
+          await persistUpdate(docId, update)
+        } catch (err) {
+          console.error(`[ws] persistUpdate failed for doc ${docId}:`, err)
+          return
+        }
         broadcastToDoc(docId, buf, ctx)
-        persistUpdate(docId, update).then(() => maybeCompact(docId)).catch(console.error)
+        maybeCompact(docId).catch(console.error)
       }
       return
     }
@@ -251,6 +260,8 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
     // ---- unsubscribeDoc ----
     if (msg.type === "unsubscribeDoc") {
       unsubscribeFromDoc(ctx, msg.docId)
+      const timer = ctx.awarenessTimeouts.get(msg.docId)
+      if (timer) { clearTimeout(timer); ctx.awarenessTimeouts.delete(msg.docId) }
       return
     }
 

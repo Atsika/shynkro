@@ -11,7 +11,6 @@ import {
 } from "../db/schema.js"
 import { withAuth } from "../middleware/auth.js"
 import { uuid, addMinutes, isValidFilePath } from "../utils.js"
-import { TEXT_EXTENSIONS } from "../fileClassifier.js"
 import { prepareDocUpdate } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { requireMember } from "../lib/authz.js"
@@ -119,6 +118,14 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
       .from(importFiles)
       .where(eq(importFiles.sessionId, params.importId))
 
+    // Store binary blobs BEFORE the DB transaction — if storage fails, abort early
+    for (const file of staged) {
+      if (file.kind === "binary" && file.content && file.hash && /^[0-9a-f]{64}$/.test(file.hash)) {
+        const data = Buffer.from(file.content, "base64")
+        await storage.put(file.hash, data)
+      }
+    }
+
     await db.transaction(async (tx) => {
       for (const file of staged) {
         const fileId = uuid()
@@ -165,18 +172,6 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
         .set({ status: "committed" })
         .where(eq(importSessions.id, params.importId))
     })
-
-    // Store binary blobs in storage backend (outside transaction — filesystem ops)
-    for (const file of staged) {
-      if (file.kind === "binary" && file.content && file.hash && /^[0-9a-f]{64}$/.test(file.hash)) {
-        try {
-          const data = Buffer.from(file.content, "base64")
-          await storage.put(file.hash, data)
-        } catch (err) {
-          console.error(`[import] Failed to store binary blob for ${file.path}:`, err)
-        }
-      }
-    }
 
     return { ok: true }
   })

@@ -14,5 +14,11 @@
   },
   "scripts": {
     "build:cjs": "bunx tsc -p tsconfig.cjs.json"
+  },
+  "dependencies": {
+    "istextorbinary": "^9.5.0"
+  },
+  "devDependencies": {
+    "@types/istextorbinary": "^5.0.0"
   }
 }

@@ -5,7 +5,7 @@ import { log } from "../logger"
 import { SHYNKRO_DIR, IMPORT_CONCURRENCY } from "../constants"
 import { buildIgnoreMatcher } from "../ignoreUtils"
 import { ensureShynkroInGitignore } from "./gitUtils"
-import { classifyFile } from "./fileClassifier"
+import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { writeProjectConfig } from "./projectConfig"
 import { acquireLock } from "../lock/lockFile"
 import type { RestClient } from "../api/restClient"
@@ -98,15 +98,15 @@ export async function executeInit(
       try {
         await runConcurrent(files, IMPORT_CONCURRENCY, async (filePath) => {
           const relPath = path.relative(workspaceRoot, filePath).replace(/\\/g, "/")
-          const kind = classifyFile(filePath)
+          const data = fs.readFileSync(filePath)
+          const kind = classifyFile(filePath) ?? classifyFileWithContent(filePath, Buffer.from(data))
 
           let content: string | undefined
           let hash: string | undefined
 
           if (kind === "text") {
-            content = fs.readFileSync(filePath, "utf-8")
+            content = data.toString("utf-8")
           } else {
-            const data = fs.readFileSync(filePath)
             const crypto = await import("crypto")
             hash = crypto.createHash("sha256").update(data).digest("hex")
             content = data.toString("base64")
