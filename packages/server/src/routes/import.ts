@@ -14,11 +14,60 @@ import { uuid, addMinutes, isValidFilePath } from "../utils.js"
 import { prepareDocUpdate } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { requireMember } from "../lib/authz.js"
+import { logger } from "../lib/logger.js"
 
 const storage = createStorageBackend()
 
 const IMPORT_SESSION_TTL_MINUTES = 30
 const MAX_IMPORT_FILES = 5000
+
+/**
+ * Per-file size cap for staged import payloads. Anything larger should go through
+ * the chunked binary upload path (D1) instead of being base64-stuffed into a JSON
+ * body. Default 100 MB; configurable via SHYNKRO_MAX_IMPORT_FILE_SIZE.
+ */
+const MAX_IMPORT_FILE_BYTES = (() => {
+  const raw = process.env.SHYNKRO_MAX_IMPORT_FILE_SIZE
+  if (!raw) return 100 * 1024 * 1024
+  const parsed = parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn("SHYNKRO_MAX_IMPORT_FILE_SIZE not a positive integer, falling back to default", { raw })
+    return 100 * 1024 * 1024
+  }
+  return parsed
+})()
+
+/**
+ * Total cap on the cumulative size of every staged import file in a single
+ * session. Bounds the worst-case memory and DB blob TEXT storage for an init.
+ * Default 5 GB; configurable via SHYNKRO_MAX_IMPORT_SESSION_SIZE.
+ */
+const MAX_IMPORT_SESSION_BYTES = (() => {
+  const raw = process.env.SHYNKRO_MAX_IMPORT_SESSION_SIZE
+  if (!raw) return 5 * 1024 * 1024 * 1024
+  const parsed = parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn("SHYNKRO_MAX_IMPORT_SESSION_SIZE not a positive integer, falling back to default", { raw })
+    return 5 * 1024 * 1024 * 1024
+  }
+  return parsed
+})()
+
+/**
+ * Estimate the byte size of a staged import file's payload. Text files are
+ * stored verbatim; binary content is base64 (≈4/3 the byte size of the source).
+ * Returns 0 for folders and missing content.
+ */
+function estimateImportFileBytes(kind: string, content: string | null | undefined): number {
+  if (!content || kind === "folder") return 0
+  if (kind === "binary") {
+    // base64 inflates by 4/3 — back-compute the source bytes from the encoded length.
+    return Math.floor((content.length * 3) / 4)
+  }
+  // Text content is stored as the original string; UTF-8 byte length is what hits
+  // the DB column. Buffer.byteLength is exact for any string.
+  return Buffer.byteLength(content, "utf-8")
+}
 
 export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import" })
   .use(withAuth)
@@ -68,6 +117,16 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
 
       if (!isValidFilePath(body.path)) return status(400, { message: "Invalid file path" })
 
+      // Per-file size cap. The largest legitimate use case is a small project
+      // template; anything bigger should be uploaded via the chunked blob path.
+      const incomingBytes = estimateImportFileBytes(body.kind, body.content)
+      if (incomingBytes > MAX_IMPORT_FILE_BYTES) {
+        return status(413, {
+          code: "IMPORT_FILE_TOO_LARGE",
+          message: `Import file ${body.path} (~${incomingBytes} bytes) exceeds SHYNKRO_MAX_IMPORT_FILE_SIZE=${MAX_IMPORT_FILE_BYTES}. Use the chunked blob upload for large files.`,
+        })
+      }
+
       const [{ value: fileCount }] = await db
         .select({ value: count() })
         .from(importFiles)
@@ -75,6 +134,28 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
 
       if (fileCount >= MAX_IMPORT_FILES) {
         return status(400, { message: `Import session cannot exceed ${MAX_IMPORT_FILES} files` })
+      }
+
+      // Cumulative session-size cap. Sum the size of every staged file already
+      // in this session and reject if adding this one would push past the limit.
+      // Cheap COALESCE-around-NULL handles the empty-session case.
+      const [sumRow] = await db.execute<{ total: number | null }>(sql`
+        SELECT COALESCE(SUM(
+          CASE
+            WHEN kind = 'binary' THEN floor(length(coalesce(content, '')) * 3 / 4)
+            WHEN kind = 'text'   THEN octet_length(coalesce(content, ''))
+            ELSE 0
+          END
+        ), 0)::bigint AS total
+        FROM import_files
+        WHERE session_id = ${params.importId}
+      `)
+      const currentTotal = Number(sumRow?.total ?? 0)
+      if (currentTotal + incomingBytes > MAX_IMPORT_SESSION_BYTES) {
+        return status(413, {
+          code: "IMPORT_SESSION_TOO_LARGE",
+          message: `Import session would exceed SHYNKRO_MAX_IMPORT_SESSION_SIZE=${MAX_IMPORT_SESSION_BYTES} (current ${currentTotal}, this file ~${incomingBytes}). Split the workspace or use the chunked blob upload for large binaries.`,
+        })
       }
 
       const fileId = uuid()

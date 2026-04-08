@@ -237,6 +237,30 @@ export class RestClient {
     if (!res.ok) throw new ApiError(res.status, "UPLOAD_FAILED", res.statusText)
   }
 
+  /**
+   * Cheap server-side size probe used by binarySync to decide between the
+   * single-shot and chunked download paths. Issues a Range request for the
+   * first byte and parses Content-Range. Returns 0 if the server doesn't
+   * support Range — caller falls back to the single-shot path in that case.
+   */
+  async probeBlobSize(workspaceId: WorkspaceId, fileId: FileId): Promise<{ totalSize: number; hash: string }> {
+    const token = await this.getToken()
+    const headers: Record<string, string> = { Range: "bytes=0-0" }
+    if (token) headers["Authorization"] = `Bearer ${token}`
+    const res = await fetch(`${this.baseUrl}/api/v1/workspaces/${workspaceId}/files/${fileId}/blob`, { headers })
+    if (!res.ok && res.status !== 206) {
+      throw new ApiError(res.status, "PROBE_FAILED", res.statusText)
+    }
+    // Drain the body so the connection is reused cleanly.
+    try { await res.arrayBuffer() } catch { /* ignore */ }
+    const cr = res.headers.get("content-range")
+    const m = cr ? cr.match(/bytes\s+\d+-\d+\/(\d+)/) : null
+    const totalSize = m
+      ? parseInt(m[1]!, 10)
+      : parseInt(res.headers.get("content-length") ?? "0", 10)
+    return { totalSize, hash: res.headers.get("x-content-hash") ?? "" }
+  }
+
   async downloadBlob(workspaceId: WorkspaceId, fileId: FileId): Promise<{ data: Uint8Array; hash: string; mode: number | null }> {
     const token = await this.getToken()
     const headers: Record<string, string> = {}

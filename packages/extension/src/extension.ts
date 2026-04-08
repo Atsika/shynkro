@@ -15,6 +15,8 @@ import { FileWatcher } from "./sync/fileWatcher"
 import { ChangeReconciler } from "./sync/changeReconciler"
 import { YjsBridge } from "./yjs/yjsBridge"
 import { BinarySync } from "./binary/binarySync"
+import { ChunkedUploader } from "./binary/chunkedUpload"
+import { ChunkedDownloader } from "./binary/chunkedDownload"
 import { findProjectConfig, writeProjectConfig } from "./workspace/projectConfig"
 import { executeInit } from "./workspace/initCommand"
 import { executeClone, executeJoin } from "./workspace/cloneCommand"
@@ -471,7 +473,21 @@ async function startSync(
   // Pass stateDb so pending Yjs frames persist across extension reloads (B2).
   wsManager = new WsManager(authService!, statusBar!, stateDb)
   fileWatcher = new FileWatcher(workspaceRoot, config.workspaceId, stateDb, restClient, wsManager)
-  const binarySync = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher)
+  // D1: chunked + resumable binary transport. The uploader/downloader use the
+  // raw fetch API + Range headers, not the REST client wrapper, because they
+  // need to stream chunks rather than buffer the whole file.
+  const chunkedUploader = new ChunkedUploader({
+    baseUrl: serverUrl,
+    getToken: () => authService!.getValidAccessToken(serverUrl).catch(() => undefined),
+  })
+  const chunkedDownloader = new ChunkedDownloader({
+    baseUrl: serverUrl,
+    getToken: () => authService!.getValidAccessToken(serverUrl).catch(() => undefined),
+  })
+  const binarySync = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher, {
+    uploader: chunkedUploader,
+    downloader: chunkedDownloader,
+  })
   changeReconciler = new ChangeReconciler(
     config.workspaceId, workspaceRoot, stateDb, restClient, fileWatcher,
     binarySync
