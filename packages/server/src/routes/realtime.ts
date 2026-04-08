@@ -20,6 +20,7 @@ import {
   persistUpdate,
   maybeCompact,
   DocCorruptedError,
+  DocDeletedError,
 } from "../services/yjsService.js"
 import {
   PROTOCOL_VERSION,
@@ -72,6 +73,17 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
             ws.send(JSON.stringify({
               type: "error",
               code: "DOC_CORRUPTED",
+              message: err.message,
+            }))
+            return
+          }
+          if (err instanceof DocDeletedError) {
+            // A late-arriving update for a file that was just deleted. Refuse the
+            // write (otherwise it could silently un-delete the file) and tell the
+            // client so they know to tear down their doc subscription.
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "DOC_DELETED",
               message: err.message,
             }))
             return
@@ -270,6 +282,12 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
           ws.send(JSON.stringify({
             type: "error",
             code: "DOC_CORRUPTED",
+            message: err.message,
+          }))
+        } else if (err instanceof DocDeletedError) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "DOC_DELETED",
             message: err.message,
           }))
         } else {

@@ -7,7 +7,7 @@ import { uuid } from "../utils.js"
 import { requireMember } from "../lib/authz.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
 import { recordChange } from "../lib/changeLog.js"
-import { getPlainText, DocCorruptedError } from "../services/yjsService.js"
+import { getPlainText, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { zipSync } from "fflate"
 
@@ -242,16 +242,24 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
     }
   )
 
-  // GET /api/v1/workspaces/:id/changes?since=
+  // GET /api/v1/workspaces/:id/changes?since=&limit=&offset=
+  //
+  // Pagination: `limit` caps how many change rows come back in a single request
+  // (default 1000, max 5000). `offset` is applied on top of the `since > N`
+  // filter so the client can stream further pages until empty. Response carries
+  // `hasMore: boolean` so clients know whether to keep paging. Prevents OOM
+  // when a long-offline client reconnects against a workspace with millions
+  // of change rows.
   .get(
     "/:id/changes",
     async ({ params, query, user }) => {
       const member = await requireMember(params.id, user.id)
       if (!member) return status(403, { message: "Forbidden" })
 
-      // For MVP we return the full tree as "changes" when since=0
-      // A proper change log table would be added in Phase 2
       const since = Math.max(0, parseInt(query.since ?? "0", 10) || 0)
+      const requestedLimit = parseInt(query.limit ?? "1000", 10) || 1000
+      const limit = Math.max(1, Math.min(5000, requestedLimit))
+      const offset = Math.max(0, parseInt(query.offset ?? "0", 10) || 0)
 
       const [ws] = await db
         .select({ revision: workspaces.revision })
@@ -272,7 +280,10 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
         }
       }
 
-      // Full re-sync if since is 0
+      // Full re-sync if since is 0. The file list is bounded by the workspace
+      // size (not the change history), so pagination isn't strictly required
+      // here — but we still respect `limit` so very large workspaces don't
+      // blow the response size.
       if (since === 0) {
         const files = await db
           .select()
@@ -283,10 +294,18 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
               eq(fileEntries.deleted, false)
             )
           )
+          .orderBy(fileEntries.id)
+          .limit(limit + 1)
+          .offset(offset)
+
+        const hasMore = files.length > limit
+        const page = hasMore ? files.slice(0, limit) : files
 
         return {
           currentRevision: ws.revision,
-          changes: files.map((f) => ({
+          hasMore,
+          nextOffset: hasMore ? offset + limit : null,
+          changes: page.map((f) => ({
             revision: ws.revision,
             type: "fileCreated" as const,
             fileId: f.id,
@@ -299,7 +318,9 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
         }
       }
 
-      // Incremental: return change log entries since the given revision
+      // Incremental: return change log entries since the given revision,
+      // paginated. Fetch `limit + 1` so we can cheaply determine `hasMore`
+      // without an extra COUNT query.
       const rows = await db
         .select()
         .from(workspaceChanges)
@@ -310,10 +331,17 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
           )
         )
         .orderBy(workspaceChanges.revision)
+        .limit(limit + 1)
+        .offset(offset)
+
+      const hasMore = rows.length > limit
+      const page = hasMore ? rows.slice(0, limit) : rows
 
       return {
         currentRevision: ws.revision,
-        changes: rows.map((r) => ({
+        hasMore,
+        nextOffset: hasMore ? offset + limit : null,
+        changes: page.map((r) => ({
           revision: r.revision,
           type: r.type as import("@shynkro/shared").WorkspaceChange["type"],
           fileId: r.fileId ?? undefined,
@@ -325,7 +353,13 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
         })),
       }
     },
-    { query: t.Object({ since: t.Optional(t.String()) }) }
+    {
+      query: t.Object({
+        since: t.Optional(t.String()),
+        limit: t.Optional(t.String()),
+        offset: t.Optional(t.String()),
+      }),
+    }
   )
 
   // GET /api/v1/workspaces/:id/export — download workspace as ZIP
@@ -362,10 +396,17 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       } catch (err) {
         // Refuse to emit a partial export — a silently-empty entry in the archive
         // would let a pentester think they have their data when they actually lost
-        // the content of a corrupted doc. Bail loudly with a clear error code.
+        // the content of a corrupted or already-soft-deleted doc. Bail loudly with
+        // a clear error code in both cases.
         if (err instanceof DocCorruptedError) {
           return status(503, {
             code: "DOC_CORRUPTED",
+            message: err.message,
+          })
+        }
+        if (err instanceof DocDeletedError) {
+          return status(410, {
+            code: "DOC_DELETED",
             message: err.message,
           })
         }

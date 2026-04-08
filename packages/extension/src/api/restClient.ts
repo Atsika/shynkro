@@ -144,8 +144,11 @@ export class RestClient {
   getSnapshot(id: WorkspaceId): Promise<WorkspaceSnapshot> {
     return this.request("GET", `/api/v1/workspaces/${id}/snapshot`)
   }
-  getChanges(id: WorkspaceId, since: number): Promise<ChangesResponse> {
-    return this.request("GET", `/api/v1/workspaces/${id}/changes?since=${since}`)
+  getChanges(id: WorkspaceId, since: number, opts?: { limit?: number; offset?: number }): Promise<ChangesResponse> {
+    const params = new URLSearchParams({ since: String(since) })
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit))
+    if (opts?.offset !== undefined) params.set("offset", String(opts.offset))
+    return this.request("GET", `/api/v1/workspaces/${id}/changes?${params.toString()}`)
   }
 
   // Import

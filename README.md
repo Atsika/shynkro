@@ -75,6 +75,80 @@ The server listens on `http://localhost:3000` by default.
 
 ---
 
+## Backup & restore
+
+Shynkro has two pieces of persistent state and **both** need to be backed up together for a consistent restore:
+
+1. **PostgreSQL** — all metadata: users, workspaces, file entries, collaborative Yjs history.
+2. **Blob storage** — the raw bytes of every binary file (screenshots, PDFs, zipped scans, etc.), under `SHYNKRO_BLOB_DIR` (defaults to `./data/blobs` in the provided `docker-compose.yml`).
+
+A PostgreSQL backup without the matching blob directory will restore to a state where every binary file is a dangling reference. Always snapshot both at the same time.
+
+### Manual backup
+
+From the host running `docker compose`:
+
+```bash
+# 1. Create a dated backup directory
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BACKUP_DIR=./backups/$STAMP
+mkdir -p "$BACKUP_DIR"
+
+# 2. Dump Postgres (plain SQL, gzip-compressed)
+docker compose exec -T postgres pg_dump -U shynkro -Fc shynkro \
+  > "$BACKUP_DIR/shynkro.dump"
+
+# 3. Snapshot the blob directory
+tar -C ./data -czf "$BACKUP_DIR/blobs.tar.gz" blobs
+```
+
+### Scheduled backup (cron)
+
+Drop this into root's crontab on the host for a nightly 02:30 backup with a 14-day retention:
+
+```cron
+30 2 * * * cd /srv/shynkro && bash -c '\
+  STAMP=$(date -u +%Y%m%dT%H%M%SZ); \
+  BACKUP_DIR=./backups/$STAMP; \
+  mkdir -p "$BACKUP_DIR" && \
+  docker compose exec -T postgres pg_dump -U shynkro -Fc shynkro > "$BACKUP_DIR/shynkro.dump" && \
+  tar -C ./data -czf "$BACKUP_DIR/blobs.tar.gz" blobs && \
+  find ./backups -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +'
+```
+
+### Restore
+
+Stop the server first so no clients are editing while you swap state. Stop Postgres before the Postgres restore, then bring everything back up.
+
+```bash
+# 0. Stop the server (keep Postgres running for pg_restore)
+docker compose stop server
+
+# 1. Restore blobs (safe to do while Postgres runs)
+rm -rf ./data/blobs
+tar -C ./data -xzf ./backups/20260408T023000Z/blobs.tar.gz
+
+# 2. Wipe and recreate the database
+docker compose exec -T postgres psql -U shynkro -c 'DROP DATABASE IF EXISTS shynkro;'
+docker compose exec -T postgres psql -U shynkro -c 'CREATE DATABASE shynkro;'
+
+# 3. Restore the dump
+docker compose exec -T postgres pg_restore -U shynkro -d shynkro --no-owner \
+  < ./backups/20260408T023000Z/shynkro.dump
+
+# 4. Restart the server
+docker compose start server
+```
+
+### Recovery windows
+
+Even without a full restore, a few things are recoverable in place:
+
+- **Accidentally deleted files** — collaborative docs are soft-deleted with a 30-day recovery window. To un-delete a file, clear the `deleted_at` column on `collaborative_docs` and the `deleted` flag on `file_entries` for that `fileId`. After 30 days the `purgeDeletedDocs` job hard-deletes the row and the associated `yjs_updates` cascade away.
+- **Unsynced client edits after abrupt removal** — when a user is removed from a workspace mid-session, any offline ops that couldn't land are serialized to `.shynkro/recovery/pending-ops-<timestamp>.json` inside their workspace directory. Opening the JSON shows the original path, kind, and content of each operation.
+
+---
+
 ## Extension setup
 
 ```bash
