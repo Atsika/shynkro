@@ -83,6 +83,8 @@ export interface CreateFileBody {
   path: string
   kind: FileKind
   content?: string
+  /** POSIX mode bits & 0o777, captured locally on POSIX systems. */
+  mode?: number
 }
 
 export interface RenameFileBody {

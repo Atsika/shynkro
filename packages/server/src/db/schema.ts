@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm"
 import {
   bigserial,
   boolean,
@@ -79,13 +80,20 @@ export const fileEntries = pgTable(
     docId: text("doc_id"), // FK -> collaborative_docs, nullable
     binaryHash: text("binary_hash"),
     binarySize: integer("binary_size"),
+    /** POSIX mode bits & 0o777, captured by the first peer that uploaded the file. */
+    mode: integer("mode"),
     deleted: boolean("deleted").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index("file_entries_workspace_id_idx").on(t.workspaceId),
-    // Unique path per workspace for non-deleted files enforced in app logic
+    // Case-insensitive uniqueness — prevents pentesters on case-insensitive
+    // filesystems (macOS / Windows) from clobbering each other when one creates
+    // `Finding.md` and the other `finding.md`.
+    uniqueIndex("file_entries_ws_path_ci_idx")
+      .on(t.workspaceId, sql`lower(${t.path})`)
+      .where(sql`${t.deleted} = false`),
   ]
 )
 

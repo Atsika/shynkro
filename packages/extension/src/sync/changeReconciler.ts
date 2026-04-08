@@ -17,6 +17,7 @@ import { ApiError } from "../api/restClient"
 import type { StateDb } from "../state/stateDb"
 import type { FileWatcher } from "./fileWatcher"
 import type { BinarySync } from "../binary/binarySync"
+import { encodeTextForDisk, defaultEol } from "../text/textNormalize"
 
 export class ChangeReconciler {
   private pollTimer: NodeJS.Timeout | null = null
@@ -118,10 +119,34 @@ export class ChangeReconciler {
 
     if (msg.kind === "text") {
       try {
+        // Server holds canonical LF / no-BOM text. Reconstruct disk format from
+        // the per-file metadata recorded by whichever client first ingested it
+        // (or fall back to the OS default for files seeded from outside this client).
         const content = await this.restClient.getFileContent(this.workspaceId, msg.fileId)
-        this.fileWatcher.addWriteTag(localPath)
-        fs.writeFileSync(localPath, content, "utf-8")
         this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind, msg.docId ?? undefined)
+        // Mode bits broadcast over the WS message — capture before write so chmod
+        // below sees them. For text files, mode flows only through the create event.
+        if (msg.mode !== null && msg.mode !== undefined) {
+          this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
+        }
+        const row = this.stateDb.getFileById(msg.fileId)
+        const eol = (row?.eolStyle ?? defaultEol()) as "lf" | "crlf"
+        const bom = !!row?.hasBom
+        const encoded = encodeTextForDisk(content, eol, bom)
+        this.fileWatcher.addWriteTag(localPath)
+        fs.writeFileSync(localPath, encoded, "utf-8")
+        // Persist the format we just used so subsequent reads stay consistent.
+        if (row && row.eolStyle === null) {
+          this.stateDb.setTextFormat(msg.fileId, eol, bom)
+        }
+        // Apply mode bits to the freshly-written file (POSIX hosts only).
+        if (process.platform !== "win32" && row?.mode !== null && row?.mode !== undefined) {
+          try {
+            fs.chmodSync(localPath, row.mode)
+          } catch (err) {
+            log.appendLine(`[reconciler] chmod ${row.mode.toString(8)} failed for ${localPath}: ${err}`)
+          }
+        }
         this.stateDb.setRevision(this.workspaceId, msg.revision)
         log.appendLine(`[reconciler] created ${msg.path}`)
         this._onTextFileRegistered.fire(localPath)
@@ -131,6 +156,12 @@ export class ChangeReconciler {
     } else if (msg.kind === "binary") {
       // Register in stateDb first so binaryUpdated can find it even if download fails
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind)
+      // Pre-seed mode if the create message carried it — binarySync.download will
+      // overwrite it with whatever the blob endpoint returns, but this keeps the
+      // record consistent in case the blob fetch fails.
+      if (msg.mode !== null && msg.mode !== undefined) {
+        this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
+      }
       this.stateDb.setRevision(this.workspaceId, msg.revision)
       try {
         await this.binarySync.download(msg.fileId, localPath, this.workspaceId)
@@ -151,9 +182,17 @@ export class ChangeReconciler {
     if (!oldLocal || !newLocal) { log.appendLine(`[reconciler] path traversal blocked: rename ${msg.oldPath} -> ${msg.path}`); return }
     try {
       fs.mkdirSync(path.dirname(newLocal), { recursive: true })
-      this.fileWatcher.addWriteTag(newLocal)
-      this.fileWatcher.addWriteTag(oldLocal)
-      fs.renameSync(oldLocal, newLocal)
+      // Only rename on disk if we still have the source and don't already have the
+      // target — otherwise this is the echo of our own local rename, where the
+      // filesystem move was performed by VS Code before this WS message arrived.
+      const oldExists = fs.existsSync(oldLocal)
+      const newExists = fs.existsSync(newLocal)
+      if (oldExists && !newExists) {
+        this.fileWatcher.addWriteTag(newLocal)
+        this.fileWatcher.addWriteTag(oldLocal)
+        fs.renameSync(oldLocal, newLocal)
+      }
+      // stateDb.renameFile is idempotent — safe to call whether or not we just moved.
       this.stateDb.renameFile(msg.fileId, msg.path)
       this.stateDb.setRevision(this.workspaceId, msg.revision)
     } catch (err) {
@@ -179,6 +218,11 @@ export class ChangeReconciler {
   private async applyBinaryUpdated(msg: BinaryUpdatedMessage): Promise<void> {
     const row = this.stateDb.getFileById(msg.fileId)
     if (!row) return
+    // Refresh stored mode bits regardless of whether content changed — covers the
+    // case where a peer ran `chmod +x` and re-uploaded the same content.
+    if (msg.mode !== null && msg.mode !== undefined) {
+      this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
+    }
     if (row.binaryHash === msg.hash) return // already have it
 
     const localPath = safeJoin(this.workspaceRoot, row.path)

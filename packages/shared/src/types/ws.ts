@@ -83,6 +83,8 @@ export interface FileCreatedMessage {
   path: string
   kind: FileKind
   docId?: DocId
+  /** POSIX mode bits & 0o777 — propagated from the uploader to all peers. */
+  mode?: number | null
   revision: number
 }
 
@@ -109,6 +111,8 @@ export interface BinaryUpdatedMessage {
   fileId: FileId
   hash: string
   size: number
+  /** POSIX mode bits & 0o777 — propagated from the uploader to all peers. */
+  mode?: number | null
   revision: number
 }
 

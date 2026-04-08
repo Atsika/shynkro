@@ -2,6 +2,7 @@ import * as fs from "fs"
 import * as vscode from "vscode"
 import * as path from "path"
 import type { WorkspaceId } from "@shynkro/shared"
+import { ApiError } from "../api/restClient"
 import type { RestClient } from "../api/restClient"
 import type { StateDb } from "../state/stateDb"
 import type { WsManager } from "../ws/wsManager"
@@ -9,6 +10,7 @@ import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { buildIgnoreMatcher } from "../ignoreUtils"
 import { ensureShynkroInGitignore } from "../workspace/gitUtils"
 import { log } from "../logger"
+import { decodeTextFile } from "../text/textNormalize"
 
 export class FileWatcher {
   private watcher: vscode.FileSystemWatcher | null = null
@@ -42,12 +44,81 @@ export class FileWatcher {
       watcher.onDidCreate((uri) => this.handleCreate(uri)),
       watcher.onDidChange((uri) => this.handleChange(uri)),
       watcher.onDidDelete((uri) => this.handleDelete(uri)),
+      // VS Code surfaces user-initiated renames via this dedicated event before
+      // the underlying filesystem watcher fires its delete+create pair. Catching
+      // it here lets us preserve the docId / Yjs collaboration history across
+      // renames instead of dropping it as a "delete then create new file".
+      vscode.workspace.onDidRenameFiles((e) => {
+        for (const f of e.files) {
+          this.handleRename(f.oldUri, f.newUri).catch((err) =>
+            log.appendLine(`[watcher] handleRename error: ${err}`)
+          )
+        }
+      }),
       gitWatcher,
       gitWatcher.onDidCreate(() => {
         log.appendLine("[watcher] .git detected — ensuring .shynkro/ in .gitignore")
         ensureShynkroInGitignore(this.workspaceRoot)
       })
     )
+  }
+
+  /**
+   * Handle a user-initiated rename. We treat it as a first-class rename op so the
+   * docId and Yjs collaboration history travel with the file. The underlying
+   * filesystem watcher will still fire delete+create events for the same paths;
+   * we suppress those by setting write tags on both sides ahead of time.
+   */
+  private async handleRename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
+    if (this.shouldIgnore(oldUri) || this.shouldIgnore(newUri)) return
+
+    const oldRel = path.relative(this.workspaceRoot, oldUri.fsPath).replace(/\\/g, "/")
+    const newRel = path.relative(this.workspaceRoot, newUri.fsPath).replace(/\\/g, "/")
+    if (oldRel === newRel) return
+
+    const row = this.stateDb.getFileByPath(oldRel)
+    if (!row) {
+      // Unknown file — let the watcher's delete/create handle it as a fresh upload.
+      return
+    }
+
+    // Suppress the delete/create echo from the underlying file system watcher.
+    // Both events will fire after this handler returns; addWriteTag is one-shot.
+    this.addWriteTag(oldUri.fsPath)
+    this.addWriteTag(newUri.fsPath)
+
+    if (!this.wsManager.connected) {
+      // Persist the local move so reads see the new path immediately, and queue
+      // the rename to replay against the server on next reconnect. The previous
+      // path is encoded in `content` (re-used field) so the drain step can rebuild
+      // the FileRenamedMessage payload.
+      this.stateDb.renameFile(row.fileId, newRel)
+      this.stateDb.enqueuePendingOp({
+        opType: "rename",
+        path: newRel,
+        fileId: row.fileId,
+        content: oldRel,
+      })
+      log.appendLine(`[watcher] offline — queued rename ${oldRel} → ${newRel}`)
+      return
+    }
+
+    try {
+      await this.restClient.renameFile(
+        this.workspaceId,
+        row.fileId as import("@shynkro/shared").FileId,
+        { path: newRel }
+      )
+      this.stateDb.renameFile(row.fileId, newRel)
+      log.appendLine(`[watcher] renamed ${oldRel} → ${newRel}`)
+    } catch (err) {
+      log.appendLine(`[watcher] handleRename REST error for ${oldRel} → ${newRel}: ${err}`)
+      if (err instanceof ApiError && err.code === "PATH_CASE_COLLISION") {
+        vscode.window.showWarningMessage(
+          `Shynkro: cannot rename to "${newRel}" — ${err.message}`
+        )
+      }
+    }
   }
 
   addWriteTag(absolutePath: string): void {
@@ -70,9 +141,14 @@ export class FileWatcher {
     if (this.stateDb.getFileByPath(relPath)) return
     let stat: fs.Stats
     try {
-      stat = fs.statSync(uri.fsPath)
+      // lstat (not stat) so we don't follow symlinks — symlinks are skipped below.
+      stat = fs.lstatSync(uri.fsPath)
     } catch {
       return // path vanished before we could stat it
+    }
+    if (stat.isSymbolicLink()) {
+      log.appendLine(`[watcher] skipping symlink: ${relPath}`)
+      return
     }
     let kind = stat.isDirectory() ? "folder" as const : classifyFile(uri.fsPath)
     if (kind === null) {
@@ -84,21 +160,37 @@ export class FileWatcher {
       }
     }
 
+    // Decode text content into canonical (LF, no BOM) form and remember the on-disk
+    // format so write-back can faithfully reconstruct it on every collaborator's machine.
+    let decoded: ReturnType<typeof decodeTextFile> | null = null
+    if (kind === "text") {
+      try {
+        const raw = fs.readFileSync(uri.fsPath, "utf-8")
+        decoded = decodeTextFile(raw)
+      } catch (err) {
+        log.appendLine(`[watcher] read error for ${relPath}: ${err}`)
+        return
+      }
+    }
+    // POSIX mode bits — meaningful on Linux/macOS, all peers preserve the bits we record.
+    const mode = stat.isFile() ? (stat.mode & 0o777) : null
+
     if (!this.wsManager.connected) {
-      const content = kind === "text" ? fs.readFileSync(uri.fsPath, "utf-8") : undefined
-      this.stateDb.enqueuePendingOp({ opType: "create", path: relPath, kind, content })
+      this.stateDb.enqueuePendingOp({ opType: "create", path: relPath, kind, content: decoded?.content })
       log.appendLine(`[watcher] offline — queued create ${relPath}`)
       return
     }
 
     try {
-      const content = kind === "text" ? fs.readFileSync(uri.fsPath, "utf-8") : undefined
       const file = await this.restClient.createFile(this.workspaceId, {
         path: relPath,
         kind,
-        content,
+        content: decoded?.content,
+        mode: mode ?? undefined,
       })
       this.stateDb.upsertFile(file.id, relPath, kind, file.docId ?? undefined)
+      if (decoded) this.stateDb.setTextFormat(file.id, decoded.eol, decoded.bom)
+      if (mode !== null) this.stateDb.setFileMode(file.id, mode)
       log.appendLine(`[watcher] created ${relPath} id=${file.id} docId=${file.docId}`)
       if (kind === "text" && file.docId) {
         this._onTextFileRegistered.fire(uri.fsPath)
@@ -107,6 +199,11 @@ export class FileWatcher {
       }
     } catch (err) {
       log.appendLine(`[watcher] handleCreate error for ${relPath}: ${err}`)
+      if (err instanceof ApiError && err.code === "PATH_CASE_COLLISION") {
+        vscode.window.showWarningMessage(
+          `Shynkro: cannot create "${relPath}" — ${err.message}`
+        )
+      }
     }
   }
 

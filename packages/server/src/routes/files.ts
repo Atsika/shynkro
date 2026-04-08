@@ -19,6 +19,18 @@ import { logger } from "../lib/logger.js"
 
 const storage = createStorageBackend()
 
+/**
+ * Detect a Postgres unique-constraint violation, optionally narrowing to a specific
+ * index name. Used so case-collision races on file_entries surface as 409s, not 500s.
+ */
+function isUniqueViolation(err: unknown, indexName?: string): boolean {
+  if (typeof err !== "object" || err === null) return false
+  const e = err as { code?: string; constraint?: string; message?: string }
+  if (e.code !== "23505") return false
+  if (!indexName) return true
+  return e.constraint === indexName || (typeof e.message === "string" && e.message.includes(indexName))
+}
+
 async function incrementRevision(workspaceId: string, tx?: Parameters<Parameters<typeof db.transaction>[0]>[0]): Promise<number> {
   const executor = tx ?? db
   const result = await executor.execute<{ revision: number }>(
@@ -39,19 +51,29 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
       if (!isValidFilePath(body.path)) return status(400, { message: "Invalid file path" })
 
+      // Case-insensitive uniqueness pre-check — produces a clear error message before
+      // hitting the partial unique index. The DB constraint is the source of truth.
       const [existing] = await db
-        .select({ id: fileEntries.id })
+        .select({ id: fileEntries.id, path: fileEntries.path })
         .from(fileEntries)
         .where(
           and(
             eq(fileEntries.workspaceId, params.id),
-            eq(fileEntries.path, body.path),
+            sql`lower(${fileEntries.path}) = lower(${body.path})`,
             eq(fileEntries.deleted, false)
           )
         )
         .limit(1)
 
-      if (existing) return status(409, { message: "Path already exists" })
+      if (existing) {
+        if (existing.path === body.path) {
+          return status(409, { message: "Path already exists" })
+        }
+        return status(409, {
+          code: "PATH_CASE_COLLISION",
+          message: `Path collides with existing file "${existing.path}" — paths are compared case-insensitively across collaborators.`,
+        })
+      }
 
       const fileId = uuid()
       const kind = body.kind
@@ -63,33 +85,49 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         docId = uuid()
       }
 
+      // Sanitize mode bits — never trust the client past the POSIX mode mask.
+      const mode = typeof body.mode === "number" ? body.mode & 0o777 : null
+
       let revision!: number
-      await db.transaction(async (tx) => {
-        await tx.insert(fileEntries).values({
-          id: fileId,
-          workspaceId: params.id,
-          path: body.path,
-          kind,
-          docId: docId ?? null,
-        })
-        if (docId) {
-          await tx.insert(collaborativeDocs).values({
-            id: docId,
+      try {
+        await db.transaction(async (tx) => {
+          await tx.insert(fileEntries).values({
+            id: fileId,
             workspaceId: params.id,
-            fileId,
-            updateCount: 0,
+            path: body.path,
+            kind,
+            docId: docId ?? null,
+            mode,
           })
-          // Initialize Yjs doc inside transaction — always create the initial state
-          if (body.content !== undefined) {
-            const update = prepareDocUpdate(body.content)
-            await tx.insert(yjsUpdates).values({ docId, data: update })
-            await tx.execute(
-              sql`UPDATE collaborative_docs SET update_count = update_count + 1 WHERE id = ${docId}`
-            )
+          if (docId) {
+            await tx.insert(collaborativeDocs).values({
+              id: docId,
+              workspaceId: params.id,
+              fileId,
+              updateCount: 0,
+            })
+            // Initialize Yjs doc inside transaction — always create the initial state
+            if (body.content !== undefined) {
+              const update = prepareDocUpdate(body.content)
+              await tx.insert(yjsUpdates).values({ docId, data: update })
+              await tx.execute(
+                sql`UPDATE collaborative_docs SET update_count = update_count + 1 WHERE id = ${docId}`
+              )
+            }
           }
+          revision = await incrementRevision(params.id, tx)
+        })
+      } catch (err) {
+        // Race: two clients creating files with case-equivalent paths land here when the
+        // pre-check passed. The unique index catches it.
+        if (isUniqueViolation(err, "file_entries_ws_path_ci_idx")) {
+          return status(409, {
+            code: "PATH_CASE_COLLISION",
+            message: `Path "${body.path}" collides case-insensitively with an existing file in this workspace.`,
+          })
         }
-        revision = await incrementRevision(params.id, tx)
-      })
+        throw err
+      }
 
       broadcastToWorkspace(params.id, {
         type: "fileCreated",
@@ -98,12 +136,13 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         path: body.path,
         kind,
         docId: docId ?? undefined,
+        mode,
         revision,
       })
 
       await recordChange({ workspaceId: params.id, revision, type: "fileCreated", fileId, path: body.path, kind })
 
-      return { id: fileId, path: body.path, kind, docId }
+      return { id: fileId, path: body.path, kind, docId, mode }
     },
     {
       body: t.Object({
@@ -112,6 +151,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
           t.Union([t.Literal("text"), t.Literal("binary"), t.Literal("folder")])
         ),
         content: t.Optional(t.String()),
+        mode: t.Optional(t.Number()),
       }),
     }
   )
@@ -179,14 +219,44 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
       const oldPath = file.path
 
+      // Pre-check case-insensitive collision with any *other* live file in this workspace.
+      const [collision] = await db
+        .select({ id: fileEntries.id, path: fileEntries.path })
+        .from(fileEntries)
+        .where(
+          and(
+            eq(fileEntries.workspaceId, params.id),
+            sql`lower(${fileEntries.path}) = lower(${body.path})`,
+            sql`${fileEntries.id} <> ${params.fileId}`,
+            eq(fileEntries.deleted, false)
+          )
+        )
+        .limit(1)
+      if (collision) {
+        return status(409, {
+          code: "PATH_CASE_COLLISION",
+          message: `Cannot rename to "${body.path}" — collides with existing file "${collision.path}".`,
+        })
+      }
+
       let revision!: number
-      await db.transaction(async (tx) => {
-        await tx
-          .update(fileEntries)
-          .set({ path: body.path, updatedAt: new Date() })
-          .where(eq(fileEntries.id, params.fileId))
-        revision = await incrementRevision(params.id, tx)
-      })
+      try {
+        await db.transaction(async (tx) => {
+          await tx
+            .update(fileEntries)
+            .set({ path: body.path, updatedAt: new Date() })
+            .where(eq(fileEntries.id, params.fileId))
+          revision = await incrementRevision(params.id, tx)
+        })
+      } catch (err) {
+        if (isUniqueViolation(err, "file_entries_ws_path_ci_idx")) {
+          return status(409, {
+            code: "PATH_CASE_COLLISION",
+            message: `Cannot rename to "${body.path}" — collides case-insensitively with an existing file.`,
+          })
+        }
+        throw err
+      }
 
       broadcastToWorkspace(params.id, {
         type: "fileRenamed",

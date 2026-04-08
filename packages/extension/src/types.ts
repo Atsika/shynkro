@@ -12,6 +12,12 @@ export interface FileMapRow {
   kind: string
   docId: string | null
   binaryHash: string | null
+  /** "lf" | "crlf" — null if not yet sniffed (binary, folder, or pre-Unit-A row) */
+  eolStyle: "lf" | "crlf" | null
+  /** SQLite stores 0/1; truthy means the on-disk file starts with a UTF-8 BOM */
+  hasBom: number
+  /** POSIX mode bits & 0o777, or null on Windows / unknown */
+  mode: number | null
 }
 
 export interface SyncState {

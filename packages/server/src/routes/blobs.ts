@@ -29,6 +29,11 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     if (file.kind !== "binary") return status(400, { message: "Not a binary file" })
 
     const clientHash = request.headers.get("x-content-hash")
+    // Per-upload POSIX mode bits, sent only by clients running on POSIX hosts.
+    // Sanitize aggressively: never trust the client past the 9-bit mode mask.
+    const modeHeader = request.headers.get("x-file-mode")
+    const mode = modeHeader !== null ? Number.parseInt(modeHeader, 10) : NaN
+    const sanitizedMode = Number.isFinite(mode) ? mode & 0o777 : null
     const body = await request.arrayBuffer()
     const data = new Uint8Array(body)
 
@@ -48,7 +53,14 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     await db.transaction(async (tx) => {
       await tx
         .update(fileEntries)
-        .set({ binaryHash: hash, binarySize: data.byteLength, updatedAt: new Date() })
+        .set({
+          binaryHash: hash,
+          binarySize: data.byteLength,
+          // Only overwrite mode if the uploader sent one — preserves any prior recording
+          // when a Windows client (no mode header) re-uploads the same file.
+          ...(sanitizedMode !== null ? { mode: sanitizedMode } : {}),
+          updatedAt: new Date(),
+        })
         .where(eq(fileEntries.id, params.fileId))
       const result = await tx.execute<{ revision: number }>(
         sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
@@ -69,12 +81,13 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
       fileId: params.fileId,
       hash,
       size: data.byteLength,
+      mode: sanitizedMode ?? file.mode ?? null,
       revision,
     })
 
     await recordChange({ workspaceId: params.id, revision, type: "binaryUpdated", fileId: params.fileId, hash, size: data.byteLength })
 
-    return { hash, size: data.byteLength }
+    return { hash, size: data.byteLength, mode: sanitizedMode ?? file.mode ?? null }
   })
 
   // GET /api/v1/workspaces/:id/files/:fileId/blob
@@ -92,11 +105,13 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     if (!file.binaryHash) return status(404, { message: "No blob uploaded yet" })
 
     const data = await storage.get(file.binaryHash)
-    return new Response(data.buffer as ArrayBuffer, {
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "X-Content-Hash": file.binaryHash,
-        "Content-Length": String(data.byteLength),
-      },
-    })
+    const headers: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+      "X-Content-Hash": file.binaryHash,
+      "Content-Length": String(data.byteLength),
+    }
+    if (file.mode !== null && file.mode !== undefined) {
+      headers["X-File-Mode"] = String(file.mode & 0o777)
+    }
+    return new Response(data.buffer as ArrayBuffer, { headers })
   })

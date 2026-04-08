@@ -1,6 +1,8 @@
 import { DatabaseSync } from "node:sqlite"
 import type { FileMapRow } from "../types"
 
+const SCHEMA_VERSION = 2
+
 export class StateDb {
   private db: DatabaseSync
 
@@ -24,6 +26,9 @@ export class StateDb {
         doc_id      TEXT,
         binary_hash TEXT,
         deleted     INTEGER NOT NULL DEFAULT 0,
+        eol_style   TEXT,
+        has_bom     INTEGER NOT NULL DEFAULT 0,
+        mode        INTEGER,
         UNIQUE(path)
       );
       CREATE TABLE IF NOT EXISTS pending_ops (
@@ -36,6 +41,33 @@ export class StateDb {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `)
+
+    // Apply incremental migrations for upgrades from older schemas.
+    const currentVersion = this.getSchemaVersion()
+    if (currentVersion < 2) {
+      // V2: file_map gains eol_style, has_bom, mode for cross-OS text/binary fidelity.
+      this.addColumnIfMissing("file_map", "eol_style", "TEXT")
+      this.addColumnIfMissing("file_map", "has_bom", "INTEGER NOT NULL DEFAULT 0")
+      this.addColumnIfMissing("file_map", "mode", "INTEGER")
+    }
+    this.setSchemaVersion(SCHEMA_VERSION)
+  }
+
+  private getSchemaVersion(): number {
+    const row = this.db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined
+    return row?.user_version ?? 0
+  }
+
+  private setSchemaVersion(version: number): void {
+    // PRAGMA does not support parameter binding — version is a trusted constant.
+    this.db.exec(`PRAGMA user_version = ${version};`)
+  }
+
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`)
+    }
   }
 
   getRevision(workspaceId: string): number {
@@ -57,13 +89,17 @@ export class StateDb {
 
   getFileByPath(filePath: string): FileMapRow | undefined {
     return this.db
-      .prepare("SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash FROM file_map WHERE path = ? AND deleted = 0")
+      .prepare(
+        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE path = ? AND deleted = 0"
+      )
       .get(filePath) as FileMapRow | undefined
   }
 
   getFileById(fileId: string): FileMapRow | undefined {
     return this.db
-      .prepare("SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash FROM file_map WHERE file_id = ? AND deleted = 0")
+      .prepare(
+        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE file_id = ? AND deleted = 0"
+      )
       .get(fileId) as FileMapRow | undefined
   }
 
@@ -80,6 +116,23 @@ export class StateDb {
           deleted     = 0
       `)
       .run(fileId, filePath, kind, docId ?? null, binaryHash ?? null)
+  }
+
+  /**
+   * Persist the on-disk text format of a file (line ending and BOM presence).
+   * Set on first ingest and never overwritten unless the user re-imports the file.
+   */
+  setTextFormat(fileId: string, eolStyle: "lf" | "crlf", hasBom: boolean): void {
+    this.db
+      .prepare("UPDATE file_map SET eol_style = ?, has_bom = ? WHERE file_id = ?")
+      .run(eolStyle, hasBom ? 1 : 0, fileId)
+  }
+
+  /** Persist the POSIX mode bits (& 0o777) of a file. No-op on Windows uploads. */
+  setFileMode(fileId: string, mode: number | null): void {
+    this.db
+      .prepare("UPDATE file_map SET mode = ? WHERE file_id = ?")
+      .run(mode, fileId)
   }
 
   renameFile(fileId: string, newPath: string): void {
@@ -113,7 +166,9 @@ export class StateDb {
 
   allFiles(): FileMapRow[] {
     return this.db
-      .prepare("SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash FROM file_map WHERE deleted = 0")
+      .prepare(
+        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE deleted = 0"
+      )
       .all() as unknown as FileMapRow[]
   }
 
@@ -124,7 +179,12 @@ export class StateDb {
 
   // ---- Offline operation queue ----
 
-  enqueuePendingOp(op: { opType: "create" | "delete"; path: string; kind?: string; content?: string; fileId?: string }): void {
+  /**
+   * Enqueue an offline op. For renames, `path` is the new path and the previous path
+   * is encoded in `content` — keeps the schema unchanged while still letting the drain
+   * step rebuild the FileRenamedMessage.
+   */
+  enqueuePendingOp(op: { opType: "create" | "delete" | "rename"; path: string; kind?: string; content?: string; fileId?: string }): void {
     this.db
       .prepare("INSERT INTO pending_ops (op_type, path, kind, content, file_id) VALUES (?, ?, ?, ?, ?)")
       .run(op.opType, op.path, op.kind ?? null, op.content ?? null, op.fileId ?? null)
