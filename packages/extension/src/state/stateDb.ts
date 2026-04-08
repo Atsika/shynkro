@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite"
 import type { FileMapRow } from "../types"
 
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 5
 
 export class StateDb {
   private db: DatabaseSync
@@ -26,6 +26,7 @@ export class StateDb {
         doc_id      TEXT,
         binary_hash TEXT,
         deleted     INTEGER NOT NULL DEFAULT 0,
+        deleted_at  TEXT,
         eol_style   TEXT,
         has_bom     INTEGER NOT NULL DEFAULT 0,
         mode        INTEGER,
@@ -77,6 +78,13 @@ export class StateDb {
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       `)
+    }
+    if (currentVersion < 5) {
+      // V5: file_map gains deleted_at so the tombstone-prune job has an age to
+      // compare against. Rows are tombstoned (deleted=1) when the user deletes
+      // a file; the tombstone survives until the server confirms the delete or
+      // the prune job sweeps anything older than the recovery window.
+      this.addColumnIfMissing("file_map", "deleted_at", "TEXT")
     }
     this.setSchemaVersion(SCHEMA_VERSION)
   }
@@ -174,10 +182,32 @@ export class StateDb {
   /**
    * Soft-delete: marks the row as deleted (tombstone) so that if the server re-surfaces
    * this file (e.g. after a server restart), applyCreated will re-delete it rather than
-   * restoring it locally.
+   * restoring it locally. The `deleted_at` timestamp is used by pruneTombstones to
+   * eventually sweep stale rows so the local database doesn't grow unbounded over months.
    */
   deleteFile(fileId: string): void {
-    this.db.prepare("UPDATE file_map SET deleted = 1 WHERE file_id = ?").run(fileId)
+    this.db
+      .prepare("UPDATE file_map SET deleted = 1, deleted_at = datetime('now') WHERE file_id = ?")
+      .run(fileId)
+  }
+
+  /**
+   * Hard-delete tombstoned rows whose `deleted_at` is older than the recovery
+   * window. Called once on extension activation so long-running workspaces
+   * don't accumulate unlimited tombstones. Rows without `deleted_at` (legacy
+   * entries from before the column existed) are also swept — they're either
+   * pre-existing tombstones whose age we can't determine, or fresh ones that
+   * will be recreated on the next tombstone insert.
+   */
+  pruneTombstones(maxAgeDays: number = 30): number {
+    const result = this.db
+      .prepare(`
+        DELETE FROM file_map
+        WHERE deleted = 1
+          AND (deleted_at IS NULL OR deleted_at < datetime('now', ?))
+      `)
+      .run(`-${maxAgeDays} days`)
+    return Number(result.changes)
   }
 
   isPathDeleted(relPath: string): boolean {

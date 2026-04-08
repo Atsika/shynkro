@@ -34,38 +34,60 @@ export class ChangeReconciler {
   ) {}
 
   async reconcile(): Promise<void> {
+    // Stream the change log in pages so a client reconnecting after a long
+    // offline stretch never loads millions of rows in one response. The first
+    // page carries `currentRevision` (frozen at fetch time); subsequent pages
+    // carry the same value so we only advance `stateDb.setRevision` once the
+    // whole stream is drained.
     const localRev = this.stateDb.getRevision(this.workspaceId)
-    let currentRevision: number
-    let changes: Awaited<ReturnType<typeof this.restClient.getChanges>>["changes"]
-    try {
-      ;({ currentRevision, changes } = await this.restClient.getChanges(this.workspaceId, localRev))
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 410) {
-        // Change log pruned — full resync from revision 0
-        ;({ currentRevision, changes } = await this.restClient.getChanges(this.workspaceId, 0))
-      } else {
+    let since = localRev
+    let offset = 0
+    let finalRevision: number | null = null
+    const LIMIT = 1000
+
+    const fetchPage = async (sinceRev: number, off: number): Promise<Awaited<ReturnType<typeof this.restClient.getChanges>>> => {
+      try {
+        return await this.restClient.getChanges(this.workspaceId, sinceRev, { limit: LIMIT, offset: off })
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 410) {
+          // Change log pruned — full resync from revision 0
+          return await this.restClient.getChanges(this.workspaceId, 0, { limit: LIMIT, offset: 0 })
+        }
         throw err
       }
     }
 
-    for (const change of changes) {
-      switch (change.type) {
-        case "fileCreated":
-          await this.applyCreated(change as unknown as FileCreatedMessage)
-          break
-        case "fileRenamed":
-          await this.applyRenamed(change as unknown as FileRenamedMessage)
-          break
-        case "fileDeleted":
-          await this.applyDeleted(change as unknown as FileDeletedMessage)
-          break
-        case "binaryUpdated":
-          await this.applyBinaryUpdated(change as unknown as BinaryUpdatedMessage)
-          break
+    while (true) {
+      const page = await fetchPage(since, offset)
+      finalRevision = page.currentRevision
+
+      for (const change of page.changes) {
+        switch (change.type) {
+          case "fileCreated":
+            await this.applyCreated(change as unknown as FileCreatedMessage)
+            break
+          case "fileRenamed":
+            await this.applyRenamed(change as unknown as FileRenamedMessage)
+            break
+          case "fileDeleted":
+            await this.applyDeleted(change as unknown as FileDeletedMessage)
+            break
+          case "binaryUpdated":
+            await this.applyBinaryUpdated(change as unknown as BinaryUpdatedMessage)
+            break
+        }
       }
+
+      if (!page.hasMore || page.nextOffset === null || page.nextOffset === undefined) break
+      offset = page.nextOffset
+      // since stays the same across pages — pagination is anchored to the
+      // original query. If the server gets new changes mid-drain, they'll
+      // arrive on the next reconcile tick via startPolling.
     }
 
-    this.stateDb.setRevision(this.workspaceId, currentRevision)
+    if (finalRevision !== null) {
+      this.stateDb.setRevision(this.workspaceId, finalRevision)
+    }
   }
 
   wireWsEvents(onServerMessage: vscode.Event<import("@shynkro/shared").ServerMessage>): void {

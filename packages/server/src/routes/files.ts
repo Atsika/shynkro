@@ -9,7 +9,7 @@ import {
 } from "../db/schema.js"
 import { withAuth } from "../middleware/auth.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
-import { getPlainText, prepareDocUpdate, DocCorruptedError } from "../services/yjsService.js"
+import { getPlainText, prepareDocUpdate, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
 import { uuid, isValidFilePath } from "../utils.js"
 import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { requireMember } from "../lib/authz.js"
@@ -204,6 +204,12 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
           message: err.message,
         })
       }
+      if (err instanceof DocDeletedError) {
+        return status(410, {
+          code: "DOC_DELETED",
+          message: err.message,
+        })
+      }
       throw err
     }
   })
@@ -264,6 +270,13 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         })
       }
 
+      // Concurrency note: the collision pre-check runs *outside* this transaction, so
+      // a racing INSERT / UPDATE can still land between the check and the UPDATE. The
+      // partial unique index `file_entries_ws_path_ci_idx` is the source of truth for
+      // correctness — the try/catch below catches the 23505 raised by Postgres when
+      // that race loses. Switching to SERIALIZABLE here would replace the 23505 with a
+      // 40001 serialization failure, requiring client retries, without actually
+      // improving the user-visible outcome; left at the default READ COMMITTED.
       let revision!: number
       try {
         await db.transaction(async (tx) => {
@@ -326,6 +339,17 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         .update(fileEntries)
         .set({ deleted: true, updatedAt: new Date() })
         .where(eq(fileEntries.id, params.fileId))
+      // Soft-delete the linked collaborative doc so the purge job can later clean
+      // up yjs_updates on its own schedule (default 30 days). The file_entries FK
+      // has onDelete:cascade, but we never hard-delete file_entries, so without
+      // this UPDATE the doc would never get cleaned up and an accidental deletion
+      // would still be recoverable — but also would never be purged.
+      if (file.docId) {
+        await tx
+          .update(collaborativeDocs)
+          .set({ deletedAt: new Date() })
+          .where(eq(collaborativeDocs.id, file.docId))
+      }
       revision = await incrementRevision(params.id, tx)
     })
 
