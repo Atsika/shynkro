@@ -7,11 +7,14 @@ import { fileRoutes } from "./routes/files.js"
 import { blobRoutes } from "./routes/blobs.js"
 import { memberRoutes } from "./routes/members.js"
 import { realtimeRoutes } from "./routes/realtime.js"
+import { uploadSessionRoutes } from "./routes/uploadSessions.js"
 import { runMigrations, closeDb } from "./db/index.js"
 import { expireImportSessions } from "./jobs/expireImportSessions.js"
 import { pruneChangeLogs } from "./jobs/pruneChangeLogs.js"
 import { purgeRecentOpIds } from "./jobs/purgeRecentOpIds.js"
 import { purgeDeletedDocs } from "./jobs/purgeDeletedDocs.js"
+import { gcBlobs } from "./jobs/gcBlobs.js"
+import { expireUploadSessions } from "./jobs/expireUploadSessions.js"
 import { closeAllConnections } from "./services/realtimeState.js"
 import { setupGracefulShutdown } from "./lib/shutdown.js"
 import { logger } from "./lib/logger.js"
@@ -24,11 +27,17 @@ await expireImportSessions()
 await pruneChangeLogs()
 await purgeRecentOpIds()
 await purgeDeletedDocs()
+await expireUploadSessions()
+// gcBlobs is intentionally NOT awaited at startup — listing every blob in a
+// large store can take a while and we don't want to block the server's first
+// listen() on it. The interval timer picks it up shortly.
 const jobInterval = setInterval(() => {
   expireImportSessions().catch((err) => logger.error("expireImportSessions failed", { err: String(err) }))
   pruneChangeLogs().catch((err) => logger.error("pruneChangeLogs failed", { err: String(err) }))
   purgeRecentOpIds().catch((err) => logger.error("purgeRecentOpIds failed", { err: String(err) }))
   purgeDeletedDocs().catch((err) => logger.error("purgeDeletedDocs failed", { err: String(err) }))
+  expireUploadSessions().catch((err) => logger.error("expireUploadSessions failed", { err: String(err) }))
+  gcBlobs().catch((err) => logger.error("gcBlobs failed", { err: String(err) }))
 }, 5 * 60 * 1000)
 
 const app = new Elysia()
@@ -38,6 +47,7 @@ const app = new Elysia()
   .use(importRoutes)
   .use(fileRoutes)
   .use(blobRoutes)
+  .use(uploadSessionRoutes)
   .use(memberRoutes)
   .use(realtimeRoutes)
   .onError(({ code, error, set }) => {

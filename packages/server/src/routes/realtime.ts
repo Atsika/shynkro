@@ -34,6 +34,27 @@ import { logger } from "../lib/logger.js"
 
 const TOKEN_EXPIRY_WARNING_SECS = 60
 
+/**
+ * Maximum size of any single binary WS frame the server will accept. Acts as a
+ * safety net against runaway memory growth — paste splitting (D6) on the client
+ * keeps normal usage well below this. If a frame exceeds this, the server closes
+ * the WS with code 1009 (Message Too Big) and the error message names the env
+ * var so an admin can bump it without redeploying code.
+ *
+ * Default: 50 MB. The cap is on the *frame*, not the cumulative Y.Doc size —
+ * the latter is bounded by paste-splitting + the optional soft warning UX.
+ */
+const WS_MAX_FRAME_BYTES = (() => {
+  const raw = process.env.SHYNKRO_WS_MAX_FRAME
+  if (!raw) return 50 * 1024 * 1024
+  const parsed = parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn("SHYNKRO_WS_MAX_FRAME is not a positive integer, falling back to default", { raw })
+    return 50 * 1024 * 1024
+  }
+  return parsed
+})()
+
 // Map from ws to context (Elysia ws lacks generic data on ServerWebSocket)
 const ctxMap = new Map<object, WsContext>()
 
@@ -54,6 +75,21 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
 
       // Viewers may not push Yjs updates
       if (ctx.role === "viewer") return
+
+      // Hard frame-size cap. A frame that exceeds the configured maximum is
+      // refused: we send a one-shot error JSON (so the client knows the env
+      // var to bump) then close the WS with 1009 Message Too Big. Returning
+      // without persisting prevents an OOM-shaped runaway from slipping by.
+      if (buf.length > WS_MAX_FRAME_BYTES) {
+        ws.send(JSON.stringify({
+          type: "error",
+          code: "FRAME_TOO_LARGE",
+          message: `WS frame ${buf.length} bytes exceeds SHYNKRO_WS_MAX_FRAME=${WS_MAX_FRAME_BYTES}. Increase the env var on the server or split the operation into smaller pieces.`,
+        }))
+        logger.warn("ws frame exceeds size cap", { size: buf.length, cap: WS_MAX_FRAME_BYTES, userId: ctx.userId })
+        ws.close(1009, "Frame too large")
+        return
+      }
 
       if (buf.length < 18) return // minimum: 1 byte type + 16 bytes docId + 1 byte data
 

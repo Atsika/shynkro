@@ -12,6 +12,18 @@ import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../
 import { atomicWriteFileSync } from "../text/atomicWrite"
 
 /**
+ * Maximum size of a single Yjs insert (in characters) before it gets split into
+ * multiple smaller transactions. Each transact() emits one WS frame, so capping
+ * the per-transact size keeps frames well under the server's 50 MB safety net
+ * (D5) even if the user pastes many MB of text into a markdown file.
+ *
+ * 256 KB strikes a balance: well below any reasonable WS cap, large enough that
+ * normal typing produces a single transact, small enough that even a 100 MB
+ * paste only generates ~400 frames.
+ */
+const PASTE_CHUNK_THRESHOLD = 256 * 1024
+
+/**
  * Convert an editor offset (which counts `\r\n` as 2 characters when the document's
  * EOL is CRLF) to the equivalent offset inside the canonical LF Yjs text.
  *
@@ -1139,25 +1151,62 @@ export class YjsBridge {
       const isCrlf = e.document.eol === vscode.EndOfLine.CRLF
       const editorTextBefore = isCrlf ? e.document.getText() : ""
       const yText = entry.yDoc.getText("content")
-      entry.yDoc.transact(() => {
-        const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset)
-        for (const change of changes) {
-          let lfOffset: number
-          let lfLength: number
-          let lfText: string
+
+      // Pre-translate every change so we can decide between the fast (atomic)
+      // path and the chunked (split-large-paste) path without re-doing the
+      // translation work twice.
+      type LfChange = { lfOffset: number; lfLength: number; lfText: string }
+      const lfChanges: LfChange[] = [...e.contentChanges]
+        .sort((a, b) => b.rangeOffset - a.rangeOffset)
+        .map((change) => {
           if (isCrlf) {
-            lfOffset = editorOffsetToLfOffset(editorTextBefore, change.rangeOffset)
-            lfLength = change.rangeLength - countCrInRange(editorTextBefore, change.rangeOffset, change.rangeLength)
-            lfText = toLf(change.text)
-          } else {
-            lfOffset = change.rangeOffset
-            lfLength = change.rangeLength
-            lfText = change.text
+            return {
+              lfOffset: editorOffsetToLfOffset(editorTextBefore, change.rangeOffset),
+              lfLength: change.rangeLength - countCrInRange(editorTextBefore, change.rangeOffset, change.rangeLength),
+              lfText: toLf(change.text),
+            }
           }
-          if (lfLength > 0) yText.delete(lfOffset, lfLength)
-          if (lfText.length > 0) yText.insert(lfOffset, lfText)
+          return { lfOffset: change.rangeOffset, lfLength: change.rangeLength, lfText: change.text }
+        })
+
+      const hasOversizedInsert = lfChanges.some((c) => c.lfText.length > PASTE_CHUNK_THRESHOLD)
+
+      if (!hasOversizedInsert) {
+        // Fast path: a normal keystroke or a small paste — apply every change
+        // inside one transact so other peers see them as a single atomic update.
+        entry.yDoc.transact(() => {
+          for (const c of lfChanges) {
+            if (c.lfLength > 0) yText.delete(c.lfOffset, c.lfLength)
+            if (c.lfText.length > 0) yText.insert(c.lfOffset, c.lfText)
+          }
+        })
+      } else {
+        // Chunked path (D6): at least one change has an insert big enough to
+        // produce a > 256 KB Yjs frame. Splitting it into multiple transacts
+        // produces multiple smaller frames, which keeps each well under the
+        // server's WS frame cap. Each transact emits its own update — we lose
+        // single-frame atomicity for this batch, but that only matters when a
+        // peer is observing mid-paste, in which case they see the paste land
+        // progressively (better UX than a multi-second freeze on a giant frame).
+        log.appendLine(`[yjsBridge] paste-chunking ${lfChanges.length} change(s) with oversized insert(s) for ${path.basename(entry.filePath)}`)
+        for (const c of lfChanges) {
+          if (c.lfLength > 0) {
+            entry.yDoc.transact(() => yText.delete(c.lfOffset, c.lfLength))
+          }
+          if (c.lfText.length === 0) continue
+          if (c.lfText.length <= PASTE_CHUNK_THRESHOLD) {
+            entry.yDoc.transact(() => yText.insert(c.lfOffset, c.lfText))
+            continue
+          }
+          // Slice the large insert. Each slice goes at the next offset along
+          // the inserted region: c.lfOffset, c.lfOffset + chunkSize, etc.
+          for (let i = 0; i < c.lfText.length; i += PASTE_CHUNK_THRESHOLD) {
+            const slice = c.lfText.slice(i, i + PASTE_CHUNK_THRESHOLD)
+            const at = c.lfOffset + i
+            entry.yDoc.transact(() => yText.insert(at, slice))
+          }
         }
-      })
+      }
       return // Only apply to the first matching doc entry
     }
   }

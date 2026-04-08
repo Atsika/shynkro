@@ -36,6 +36,13 @@
       "when": 1775300000000,
       "tag": "0004_unit_c_soft_delete_docs",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1775400000000,
+      "tag": "0005_unit_d_upload_sessions",
+      "breakpoints": true
     }
   ]
 }

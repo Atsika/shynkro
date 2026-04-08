@@ -353,12 +353,13 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       revision = await incrementRevision(params.id, tx)
     })
 
-    // Clean up blob from storage (best-effort, after successful DB update)
-    if (file.binaryHash) {
-      storage.delete(file.binaryHash).catch((err) =>
-        logger.error("blob cleanup failed", { hash: file.binaryHash, err: String(err) })
-      )
-    }
+    // Blob cleanup is delegated to gcBlobs (D8). The previous unconditional
+    // best-effort delete here was unsafe — if another file deduped onto the
+    // same hash, deleting it would silently break that other file. The
+    // orphan-GC job checks reference state safely under a grace period and
+    // also gives the soft-delete recovery window time to work, since soft-
+    // deleted file_entries rows still keep their binary_hash populated and
+    // therefore still count as references during the recovery period.
 
     broadcastToWorkspace(params.id, {
       type: "fileDeleted",

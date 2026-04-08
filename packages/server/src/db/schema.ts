@@ -176,6 +176,41 @@ export const importSessions = pgTable("import_sessions", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
 
+// ---- Upload sessions (chunked + resumable binary upload) ----
+
+/**
+ * Tracks an in-progress chunked binary upload. The actual chunk bytes live on
+ * the storage backend under `<SHYNKRO_BLOB_DIR>/.upload-sessions/<id>/<index>.bin`;
+ * this row holds the metadata so a client can resume after a reconnect or
+ * extension restart, and so the expireUploadSessions job can clean up
+ * abandoned sessions safely.
+ *
+ * Sessions live until their `expiresAt` timestamp passes, at which point both
+ * the row and the temp directory are deleted by the periodic job.
+ */
+export const uploadSessions = pgTable(
+  "upload_sessions",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+    fileId: text("file_id").notNull().references(() => fileEntries.id, { onDelete: "cascade" }),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    /** Total file size in bytes — used for the disk-space pre-flight + sanity check on complete. */
+    totalSize: integer("total_size").notNull(),
+    chunkSize: integer("chunk_size").notNull(),
+    totalChunks: integer("total_chunks").notNull(),
+    /** SHA-256 hex of the full file, declared by the client and verified at complete time. */
+    expectedSha256: text("expected_sha256").notNull(),
+    fileName: text("file_name"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("upload_sessions_expires_at_idx").on(t.expiresAt),
+    index("upload_sessions_workspace_id_idx").on(t.workspaceId),
+  ]
+)
+
 // ---- Recent op IDs (idempotency cache for pending_ops replays) ----
 
 /**

@@ -152,12 +152,37 @@ export class FileWatcher {
     }
     let kind = stat.isDirectory() ? "folder" as const : classifyFile(uri.fsPath)
     if (kind === null) {
+      // Read only the first 4 KB for content-sniffing — istextorbinary's
+      // heuristic looks at a leading window, so loading the whole file is
+      // wasteful and OOM-prone for large unknown-extension files (zipped
+      // scans, pcaps, anything without a recognizable suffix).
       try {
-        const buf = fs.readFileSync(uri.fsPath)
-        kind = classifyFileWithContent(uri.fsPath, Buffer.from(buf))
+        const fd = fs.openSync(uri.fsPath, "r")
+        try {
+          const sniff = Buffer.alloc(Math.min(4096, stat.size))
+          if (sniff.length > 0) fs.readSync(fd, sniff, 0, sniff.length, 0)
+          kind = classifyFileWithContent(uri.fsPath, sniff)
+        } finally {
+          fs.closeSync(fd)
+        }
       } catch {
         kind = "text"
       }
+    }
+
+    // Reject text files larger than the import file size cap on the server,
+    // since they would be rejected anyway by the REST endpoint and we'd waste
+    // a full read+UTF-8 decode pass first. Match the server default; admins who
+    // bump SHYNKRO_MAX_IMPORT_FILE_SIZE on the server will need to bump this
+    // matching constant in a follow-up. The hard cap protects against an
+    // accidental drag of a huge log file into the workspace.
+    const TEXT_FILE_SOFT_MAX = 100 * 1024 * 1024
+    if (kind === "text" && stat.isFile() && stat.size > TEXT_FILE_SOFT_MAX) {
+      log.appendLine(`[watcher] skipping oversized text file ${relPath} (${stat.size} bytes > ${TEXT_FILE_SOFT_MAX})`)
+      vscode.window.showWarningMessage(
+        `Shynkro: "${relPath}" is too large for text sync (${Math.round(stat.size / 1024 / 1024)} MB). Convert to binary or split into smaller files.`
+      )
+      return
     }
 
     // Decode text content into canonical (LF, no BOM) form and remember the on-disk

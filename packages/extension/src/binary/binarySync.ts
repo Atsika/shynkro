@@ -8,6 +8,8 @@ import type { StateDb } from "../state/stateDb"
 import type { FileWatcher } from "../sync/fileWatcher"
 import { log } from "../logger"
 import { atomicWriteFileSync } from "../text/atomicWrite"
+import { ChunkedUploader, CHUNKED_UPLOAD_THRESHOLD } from "./chunkedUpload"
+import { ChunkedDownloader, CHUNKED_DOWNLOAD_THRESHOLD } from "./chunkedDownload"
 
 const IS_WINDOWS = os.platform() === "win32"
 
@@ -16,7 +18,13 @@ export class BinarySync {
     private readonly restClient: RestClient,
     private readonly stateDb: StateDb,
     private readonly workspaceRoot: string,
-    private readonly fileWatcher: FileWatcher
+    private readonly fileWatcher: FileWatcher,
+    /**
+     * Optional dependency for the chunked upload/download path. When omitted,
+     * binarySync falls back to the legacy single-shot REST endpoints — used
+     * by older callers that haven't been wired up yet.
+     */
+    private readonly chunked?: { uploader: ChunkedUploader; downloader: ChunkedDownloader }
   ) {}
 
   async computeHash(filePath: string): Promise<string> {
@@ -30,46 +38,91 @@ export class BinarySync {
   }
 
   async upload(fileId: FileId, localPath: string, workspaceId: WorkspaceId): Promise<void> {
+    let stat: fs.Stats
+    try {
+      stat = fs.statSync(localPath)
+    } catch (err) {
+      log.appendLine(`[binarySync] upload stat failed for ${localPath}: ${err}`)
+      return
+    }
+    const fileMode = !IS_WINDOWS ? (stat.mode & 0o777) : null
+
+    // D1: route large files through the chunked + resumable path so we never
+    // hold a 1 GB+ pcap in memory and a network blip mid-upload can resume
+    // from the next un-acked chunk instead of starting over from byte 0.
+    if (this.chunked && stat.size > CHUNKED_UPLOAD_THRESHOLD) {
+      try {
+        const { hash } = await this.chunked.uploader.upload(workspaceId, fileId, localPath)
+        this.stateDb.updateBinaryHash(fileId, hash)
+        if (fileMode !== null) this.stateDb.setFileMode(fileId, fileMode)
+        log.appendLine(`[binarySync] chunked upload complete for ${path.basename(localPath)} (${stat.size} bytes, hash=${hash.slice(0, 12)}…)`)
+        return
+      } catch (err) {
+        log.appendLine(`[binarySync] chunked upload failed for ${localPath}: ${err}`)
+        throw err
+      }
+    }
+
+    // Single-shot path for files at-or-below the threshold.
     const hash = await this.computeHash(localPath)
     const row = this.stateDb.getFileById(fileId)
     if (row?.binaryHash === hash) return // no change
 
-    // Capture mode bits before upload so we can both forward them to the server
-    // (for cross-machine restoration) and persist locally. On Windows we leave
-    // the existing server-side value untouched by passing null.
-    let mode: number | null = null
-    if (!IS_WINDOWS) {
-      try {
-        mode = fs.statSync(localPath).mode & 0o777
-      } catch {
-        // path vanished between hash and stat — best effort
-      }
-    }
-
     const data = fs.readFileSync(localPath)
-    await this.restClient.uploadBlob(workspaceId, fileId, data, hash, mode)
+    await this.restClient.uploadBlob(workspaceId, fileId, data, hash, fileMode)
     this.stateDb.updateBinaryHash(fileId, hash)
-    if (mode !== null) this.stateDb.setFileMode(fileId, mode)
+    if (fileMode !== null) this.stateDb.setFileMode(fileId, fileMode)
   }
 
   async download(fileId: FileId, localPath: string, workspaceId: WorkspaceId): Promise<void> {
+    // D1: probe the server-side size cheaply via a Range probe and route
+    // anything above the threshold through the streaming chunked downloader.
+    // The probe is a one-byte range request — costs nothing relative to a
+    // full GET we'd otherwise have to discard.
+    if (this.chunked) {
+      const probedSize = await this.probeServerSize(fileId, workspaceId)
+      if (probedSize !== null && probedSize > CHUNKED_DOWNLOAD_THRESHOLD) {
+        try {
+          this.fileWatcher.addWriteTag(localPath)
+          const result = await this.chunked.downloader.download(workspaceId, fileId, localPath)
+          this.stateDb.updateBinaryHash(fileId, result.hash)
+          if (result.mode !== null) this.stateDb.setFileMode(fileId, result.mode)
+          log.appendLine(`[binarySync] chunked download complete for ${path.basename(localPath)} (${result.size} bytes)`)
+          return
+        } catch (err) {
+          log.appendLine(`[binarySync] chunked download failed for ${localPath}: ${err}`)
+          throw err
+        }
+      }
+    }
+
     const { data, hash, mode } = await this.restClient.downloadBlob(workspaceId, fileId)
-    // Atomic write: a crash mid-transfer leaves the target untouched. For a 1 GB
-    // pcap that's the difference between a retry and silent corruption.
+    // Atomic write: a crash mid-transfer leaves the target untouched.
     this.fileWatcher.addWriteTag(localPath)
     atomicWriteFileSync(localPath, data)
     this.stateDb.updateBinaryHash(fileId, hash)
-    // Persist whatever mode the server returned (if any) so subsequent uploads from
-    // this client also know the canonical bits.
     if (mode !== null) this.stateDb.setFileMode(fileId, mode)
-    // Restore POSIX mode bits if known. No-op on Windows where the bits we store
-    // from POSIX peers don't map cleanly onto NTFS ACLs.
     if (!IS_WINDOWS && mode !== null) {
       try {
         fs.chmodSync(localPath, mode)
       } catch (err) {
         log.appendLine(`[binarySync] chmod ${mode.toString(8)} failed for ${localPath}: ${err}`)
       }
+    }
+  }
+
+  /**
+   * Cheap server-side size probe — reuses restClient.probeBlobSize, which
+   * issues a HEAD-shaped Range request and parses Content-Range. Returns
+   * null on any failure so the caller falls back to the single-shot path.
+   */
+  private async probeServerSize(fileId: FileId, workspaceId: WorkspaceId): Promise<number | null> {
+    try {
+      const { totalSize } = await this.restClient.probeBlobSize(workspaceId, fileId)
+      return totalSize
+    } catch (err) {
+      log.appendLine(`[binarySync] probeServerSize failed: ${err}`)
+      return null
     }
   }
 }

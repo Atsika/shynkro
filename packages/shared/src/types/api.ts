@@ -95,6 +95,34 @@ export interface RenameFileBody {
   path: string
 }
 
+// Chunked + resumable binary upload (D1)
+
+export interface BeginUploadSessionBody {
+  totalSize: number
+  sha256: string
+  chunkSize?: number
+  fileName?: string
+}
+
+export interface BeginUploadSessionResponse {
+  sessionId: string
+  chunkSize: number
+  totalChunks: number
+  expiresAt: string
+}
+
+export interface UploadSessionStatus {
+  sessionId: string
+  totalChunks: number
+  receivedChunks: number[]
+  complete: boolean
+}
+
+export interface CompleteUploadSessionResponse {
+  hash: string
+  size: number
+}
+
 // Members
 
 export interface InviteMemberBody {
