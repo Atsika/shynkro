@@ -203,12 +203,13 @@ export class RestClient {
   }
 
   // Blobs
-  async uploadBlob(workspaceId: WorkspaceId, fileId: FileId, data: Uint8Array, hash: string): Promise<void> {
+  async uploadBlob(workspaceId: WorkspaceId, fileId: FileId, data: Uint8Array, hash: string, mode?: number | null): Promise<void> {
     const token = await this.getToken()
     const headers: Record<string, string> = {
       "Content-Type": "application/octet-stream",
       "X-Content-Hash": hash,
     }
+    if (mode !== undefined && mode !== null) headers["X-File-Mode"] = String(mode & 0o777)
     if (token) headers["Authorization"] = `Bearer ${token}`
     let res: Response
     try {
@@ -223,7 +224,7 @@ export class RestClient {
     if (!res.ok) throw new ApiError(res.status, "UPLOAD_FAILED", res.statusText)
   }
 
-  async downloadBlob(workspaceId: WorkspaceId, fileId: FileId): Promise<{ data: Uint8Array; hash: string }> {
+  async downloadBlob(workspaceId: WorkspaceId, fileId: FileId): Promise<{ data: Uint8Array; hash: string; mode: number | null }> {
     const token = await this.getToken()
     const headers: Record<string, string> = {}
     if (token) headers["Authorization"] = `Bearer ${token}`
@@ -235,7 +236,10 @@ export class RestClient {
     }
     if (!res.ok) throw new ApiError(res.status, "DOWNLOAD_FAILED", res.statusText)
     const hash = res.headers.get("X-Content-Hash") ?? ""
+    const modeHeader = res.headers.get("X-File-Mode")
+    const parsed = modeHeader !== null ? Number.parseInt(modeHeader, 10) : NaN
+    const mode = Number.isFinite(parsed) ? parsed & 0o777 : null
     const buf = await res.arrayBuffer()
-    return { data: new Uint8Array(buf), hash }
+    return { data: new Uint8Array(buf), hash, mode }
   }
 }

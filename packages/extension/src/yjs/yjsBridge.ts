@@ -8,6 +8,40 @@ import type { WsManager } from "../ws/wsManager"
 import type { FileWatcher } from "../sync/fileWatcher"
 import { ConflictManager } from "../conflict/conflictManager"
 import { log } from "../logger"
+import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../text/textNormalize"
+
+/**
+ * Convert an editor offset (which counts `\r\n` as 2 characters when the document's
+ * EOL is CRLF) to the equivalent offset inside the canonical LF Yjs text.
+ *
+ * Each `\r` character in the editor representation has no counterpart in the LF
+ * representation, so the LF offset is `editorOffset` minus the number of `\r`s
+ * appearing before that position in `editorText`.
+ *
+ * Cheap O(n) scan; called on every keystroke but `n` is bounded by the cursor
+ * position, not the whole file.
+ */
+function editorOffsetToLfOffset(editorText: string, editorOffset: number): number {
+  let crCount = 0
+  const limit = Math.min(editorOffset, editorText.length)
+  for (let i = 0; i < limit; i++) {
+    if (editorText.charCodeAt(i) === 13 /* \r */) crCount++
+  }
+  return editorOffset - crCount
+}
+
+/**
+ * Count `\r` characters in `editorText[from..from+length)` — used to translate a
+ * `change.rangeLength` (editor units) into the corresponding number of LF units.
+ */
+function countCrInRange(editorText: string, from: number, length: number): number {
+  const end = Math.min(from + length, editorText.length)
+  let cr = 0
+  for (let i = from; i < end; i++) {
+    if (editorText.charCodeAt(i) === 13 /* \r */) cr++
+  }
+  return cr
+}
 
 interface DocEntry {
   yDoc: Y.Doc
@@ -327,13 +361,27 @@ export class YjsBridge {
   /**
    * Called when a tracked text file is modified by an external tool (e.g. vim, git).
    * Applies the new disk content to the Yjs doc so it propagates to the server and peers.
+   *
+   * Disk content is normalized to canonical LF / no-BOM form before reaching the Y.Doc.
+   * If this is the first time we've seen the file (no eol_style stored), we sniff the
+   * format from the disk content and remember it for future write-backs.
    */
   handleExternalTextEdit(filePath: string, docId: string): void {
-    let diskText: string
+    let rawDiskText: string
     try {
-      diskText = fs.readFileSync(filePath, "utf-8")
+      rawDiskText = fs.readFileSync(filePath, "utf-8")
     } catch {
       return
+    }
+    const decoded = decodeTextFile(rawDiskText)
+    const diskText = decoded.content
+    // Persist the format the first time we see it for this file. We look up the row
+    // by path because handleExternalTextEdit doesn't carry the fileId — and the path
+    // → fileId mapping is what stateDb is built around.
+    const relPath = path.relative(this.workspaceRoot, filePath).replace(/\\/g, "/")
+    const row = this.stateDb.getFileByPath(relPath)
+    if (row && row.eolStyle === null) {
+      this.stateDb.setTextFormat(row.fileId, decoded.eol, decoded.bom)
     }
 
     // Helper: apply newText to yDoc using prefix/suffix ops (CRDT-friendly)
@@ -414,10 +462,12 @@ export class YjsBridge {
           // Decode server content into a temp doc (don't touch the real Y.Doc yet)
           const tempDoc = new Y.Doc()
           Y.applyUpdate(tempDoc, frame.data, "remote")
-          const serverText = tempDoc.getText("content").toString()
+          const serverText = tempDoc.getText("content").toString() // canonical LF
           tempDoc.destroy()
 
-          const editorText = entry.editor.document.getText()
+          // Compare in canonical LF form so a Linux/Windows EOL mismatch on disk
+          // does not look like a conflict.
+          const editorText = toLf(entry.editor.document.getText())
 
           if (editorText !== serverText && editorText.length > 0 && serverText.length > 0) {
             // Check if the divergence is just a stale editor buffer — e.g. the file was
@@ -425,7 +475,11 @@ export class YjsBridge {
             // If disk already has the server content and the user hasn't made unsaved edits,
             // the editor is simply stale: apply the server state silently.
             let diskText: string | null = null
-            try { diskText = fs.readFileSync(entry.filePath, "utf-8") } catch {}
+            try {
+              const raw = fs.readFileSync(entry.filePath, "utf-8")
+              // Strip BOM and CRLF on the disk side too — same canonical form as server.
+              diskText = decodeTextFile(raw).content
+            } catch {}
             const editorIsStale = diskText === serverText && !entry.editor.document.isDirty
 
             if (editorIsStale) {
@@ -486,11 +540,23 @@ export class YjsBridge {
         // the Y.Doc state will be rebuilt from the user's resolution when they reopen.
         if (bgEntry.pendingConflict) return
 
-        // Capture state before applying — for conflict detection
+        // Capture state before applying — for conflict detection. Read disk in
+        // canonical LF / no-BOM form so a CRLF↔LF mismatch on disk doesn't look
+        // like a conflict.
         let localTextBefore: string | null = null
         if (frame.frameType === WS_BINARY_YJS_STATE) {
           bgEntry.hasReceivedState = true
-          try { localTextBefore = fs.readFileSync(bgEntry.filePath, "utf-8") } catch {}
+          try {
+            const raw = fs.readFileSync(bgEntry.filePath, "utf-8")
+            const decoded = decodeTextFile(raw)
+            localTextBefore = decoded.content
+            // Persist sniffed format on first sight (matches handleExternalTextEdit).
+            const relPath = path.relative(this.workspaceRoot, bgEntry.filePath).replace(/\\/g, "/")
+            const row = this.stateDb.getFileByPath(relPath)
+            if (row && row.eolStyle === null) {
+              this.stateDb.setTextFormat(row.fileId, decoded.eol, decoded.bom)
+            }
+          } catch {}
         }
 
         Y.applyUpdate(bgEntry.yDoc, frame.data, "remote")
@@ -735,17 +801,21 @@ export class YjsBridge {
       entry.writeTimer = null
       // Don't write if the file was deleted — prevents re-creating deleted files on reconnect
       const relPath = path.relative(this.workspaceRoot, entry.filePath).replace(/\\/g, "/")
-      if (!this.stateDb.getFileByPath(relPath)) {
+      const row = this.stateDb.getFileByPath(relPath)
+      if (!row) {
         log.appendLine(`[yjsBridge] skipping background write for deleted file ${path.basename(entry.filePath)}`)
         this.backgroundDocs.delete(docId)
         return
       }
-      const text = entry.yDoc.getText("content").toString()
+      const lfText = entry.yDoc.getText("content").toString()
+      const eol = (row.eolStyle ?? defaultEol()) as "lf" | "crlf"
+      const bom = !!row.hasBom
+      const encoded = encodeTextForDisk(lfText, eol, bom)
       try {
         fs.mkdirSync(path.dirname(entry.filePath), { recursive: true })
         this.fileWatcher.addWriteTag(entry.filePath)
-        fs.writeFileSync(entry.filePath, text, "utf-8")
-        log.appendLine(`[yjsBridge] background wrote ${path.basename(entry.filePath)} (${text.length} chars)`)
+        fs.writeFileSync(entry.filePath, encoded, "utf-8")
+        log.appendLine(`[yjsBridge] background wrote ${path.basename(entry.filePath)} (${lfText.length} chars, eol=${eol}${bom ? ", bom" : ""})`)
       } catch (err) {
         log.appendLine(`[yjsBridge] background write error for ${path.basename(entry.filePath)}: ${err}`)
       }
@@ -761,7 +831,7 @@ export class YjsBridge {
 
   private async applyDocToEditor(entry: DocEntry, retries = 3, onSuccess?: () => void): Promise<void> {
     if (entry.pendingConflict) { onSuccess?.(); return }
-    const text = entry.yDoc.getText("content").toString()
+    const lfText = entry.yDoc.getText("content").toString()
 
     // Refresh editor reference if the old one is dead
     const liveEditor = this.findEditorForFile(entry.filePath)
@@ -778,7 +848,10 @@ export class YjsBridge {
         return
       }
     }
-    if (doc.getText() === text) {
+    // Expand canonical LF text to whatever EOL the editor's document uses, so we
+    // never insert mixed line endings into a CRLF buffer.
+    const editorText = doc.eol === vscode.EndOfLine.CRLF ? fromLf(lfText, "crlf") : lfText
+    if (doc.getText() === editorText) {
       onSuccess?.()
       return
     }
@@ -787,7 +860,7 @@ export class YjsBridge {
     entry.applyingRemote++
     const edit = new vscode.WorkspaceEdit()
     const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length))
-    edit.replace(doc.uri, fullRange, text)
+    edit.replace(doc.uri, fullRange, editorText)
     const ok = await vscode.workspace.applyEdit(edit)
     entry.applyingRemote--
     if (ok) {
@@ -851,12 +924,33 @@ export class YjsBridge {
         return
       }
 
+      // VS Code surfaces change.rangeOffset / change.rangeLength in *editor*
+      // coordinates — i.e. with `\r\n` counted as 2 chars when the document EOL
+      // is CRLF. The Y.Doc holds canonical LF text, so we translate offsets
+      // before applying. Snapshotting editorTextBefore once per event keeps the
+      // translation stable across multiple changes (and matches the order they
+      // were produced — sorted descending by offset, which is the existing
+      // contract that lets multi-edit changes apply without re-numbering).
+      const isCrlf = e.document.eol === vscode.EndOfLine.CRLF
+      const editorTextBefore = isCrlf ? e.document.getText() : ""
       const yText = entry.yDoc.getText("content")
       entry.yDoc.transact(() => {
         const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset)
         for (const change of changes) {
-          if (change.rangeLength > 0) yText.delete(change.rangeOffset, change.rangeLength)
-          if (change.text) yText.insert(change.rangeOffset, change.text)
+          let lfOffset: number
+          let lfLength: number
+          let lfText: string
+          if (isCrlf) {
+            lfOffset = editorOffsetToLfOffset(editorTextBefore, change.rangeOffset)
+            lfLength = change.rangeLength - countCrInRange(editorTextBefore, change.rangeOffset, change.rangeLength)
+            lfText = toLf(change.text)
+          } else {
+            lfOffset = change.rangeOffset
+            lfLength = change.rangeLength
+            lfText = change.text
+          }
+          if (lfLength > 0) yText.delete(lfOffset, lfLength)
+          if (lfText.length > 0) yText.insert(lfOffset, lfText)
         }
       })
       return // Only apply to the first matching doc entry

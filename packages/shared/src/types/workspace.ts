@@ -51,6 +51,8 @@ export interface FileEntry {
   docId?: DocId
   binaryHash?: string
   binarySize?: number
+  /** POSIX mode bits & 0o777, captured at upload. Null on Windows or for unknown files. */
+  mode?: number | null
   createdAt: string
   updatedAt: string
 }
