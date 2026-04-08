@@ -26,6 +26,20 @@ export class DocCorruptedError extends Error {
   }
 }
 
+/**
+ * Thrown when a caller tries to load a doc that has been soft-deleted (the
+ * owning file was deleted but the purge job hasn't run yet). The file is
+ * recoverable by clearing deleted_at, but in the meantime the doc is not
+ * available for editing or reading. Surfaces as a 410 / DOC_DELETED.
+ */
+export class DocDeletedError extends Error {
+  readonly code = "DOC_DELETED"
+  constructor(public readonly docId: string) {
+    super(`Collaborative document ${docId} has been deleted`)
+    this.name = "DocDeletedError"
+  }
+}
+
 function sha256Hex(data: Uint8Array | Buffer): string {
   return createHash("sha256").update(data).digest("hex")
 }
@@ -57,6 +71,7 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
 
   if (!docRow) throw new Error(`Doc not found: ${docId}`)
   if (docRow.corrupted) throw new DocCorruptedError(docId)
+  if (docRow.deletedAt) throw new DocDeletedError(docId)
 
   const doc = new Y.Doc()
 
@@ -106,13 +121,16 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
 export async function persistUpdate(docId: string, update: Uint8Array): Promise<void> {
   // Refuse writes on docs that have already been flagged corrupted — prevents an
   // edit made against a "recovered" empty doc from becoming the new source of truth.
+  // Also refuse writes on soft-deleted docs so a late-arriving client can't
+  // accidentally un-delete a file by continuing to push updates.
   const [docRow] = await db
-    .select({ corrupted: collaborativeDocs.corrupted })
+    .select({ corrupted: collaborativeDocs.corrupted, deletedAt: collaborativeDocs.deletedAt })
     .from(collaborativeDocs)
     .where(eq(collaborativeDocs.id, docId))
     .limit(1)
   if (!docRow) throw new Error(`Doc not found: ${docId}`)
   if (docRow.corrupted) throw new DocCorruptedError(docId)
+  if (docRow.deletedAt) throw new DocDeletedError(docId)
 
   await db.insert(yjsUpdates).values({
     docId,

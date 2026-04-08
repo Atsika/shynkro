@@ -119,6 +119,14 @@ export const collaborativeDocs = pgTable("collaborative_docs", {
    * manual intervention (restore from backup or clear the flag) to recover.
    */
   corrupted: boolean("corrupted").notNull().default(false),
+  /**
+   * Soft-delete timestamp. Set when the owning `file_entry` is deleted. Gives a
+   * recovery window (default 30 days, configurable at the job) during which an
+   * accidental pentest report deletion can be rolled back by clearing this column.
+   * A background job hard-deletes rows whose deletedAt is older than the window —
+   * at that point the associated yjs_updates cascade away and the doc is gone for good.
+   */
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
 

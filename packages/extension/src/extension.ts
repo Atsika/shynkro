@@ -460,6 +460,14 @@ async function startSync(
   const dbPath = path.join(shynkroDir, "state.db")
   log.appendLine(`[sync] opening stateDb at ${dbPath}`)
   stateDb = makeStateDb(dbPath)
+  // Prune stale tombstones so long-running workspaces don't grow the SQLite
+  // file unbounded over months. Default is 30 days; tombstones are normally
+  // cleared by purgeFile as soon as the server confirms a delete, so this
+  // only catches the edge case where that confirmation never arrived.
+  const prunedTombstones = stateDb.pruneTombstones()
+  if (prunedTombstones > 0) {
+    log.appendLine(`[sync] pruned ${prunedTombstones} stale tombstone row(s) from file_map`)
+  }
   // Pass stateDb so pending Yjs frames persist across extension reloads (B2).
   wsManager = new WsManager(authService!, statusBar!, stateDb)
   fileWatcher = new FileWatcher(workspaceRoot, config.workspaceId, stateDb, restClient, wsManager)

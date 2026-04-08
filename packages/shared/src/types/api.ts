@@ -61,6 +61,10 @@ export interface UpdateWorkspaceBody {
 
 export interface ChangesResponse {
   currentRevision: number
+  /** True if more pages are available past this response. */
+  hasMore?: boolean
+  /** Offset to pass on the next page request, or null when the stream is drained. */
+  nextOffset?: number | null
   changes: WorkspaceChange[]
 }
 

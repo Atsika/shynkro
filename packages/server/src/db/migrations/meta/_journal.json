@@ -29,6 +29,13 @@
       "when": 1775200000000,
       "tag": "0003_unit_b_recent_op_ids",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1775300000000,
+      "tag": "0004_unit_c_soft_delete_docs",
+      "breakpoints": true
     }
   ]
 }
