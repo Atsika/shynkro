@@ -15,6 +15,20 @@
       "when": 1775000000000,
       "tag": "0001_unit_a_cross_os",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1775100000000,
+      "tag": "0002_unit_b_snapshot_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1775200000000,
+      "tag": "0003_unit_b_recent_op_ids",
+      "breakpoints": true
     }
   ]
 }

@@ -104,8 +104,21 @@ export const collaborativeDocs = pgTable("collaborative_docs", {
   workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
   fileId: text("file_id").notNull().references(() => fileEntries.id, { onDelete: "cascade" }),
   snapshot: bytea("snapshot"), // latest Yjs snapshot
+  /**
+   * Hex-encoded SHA-256 of the snapshot bytes, written atomically with the snapshot itself.
+   * On load, the hash is re-computed and compared; a mismatch — or a failure to apply the
+   * snapshot as a Yjs update — flips the `corrupted` flag and halts writes for this doc.
+   * Null for docs that have no snapshot yet (fresh docs store their state as yjs_updates rows).
+   */
+  snapshotHash: text("snapshot_hash"),
   snapshotAt: timestamp("snapshot_at", { withTimezone: true }),
   updateCount: integer("update_count").notNull().default(0),
+  /**
+   * Sticky corruption flag. Once set, `loadDoc` and `persistUpdate` refuse to touch the doc
+   * so a freshly-created empty Y.Doc cannot silently overwrite the real content. Requires
+   * manual intervention (restore from backup or clear the flag) to recover.
+   */
+  corrupted: boolean("corrupted").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
 
@@ -154,6 +167,32 @@ export const importSessions = pgTable("import_sessions", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
+
+// ---- Recent op IDs (idempotency cache for pending_ops replays) ----
+
+/**
+ * Remembers the result of recently-processed client ops so a replay — e.g. an
+ * extension that crashed between server-applied and client-acked, then drained
+ * its pending_ops queue on restart — returns the stored result instead of
+ * re-executing the mutation. Prevents double-creates and spurious conflicts.
+ *
+ * Rows are keyed by the client-generated UUID from the X-Shynkro-Op-Id header.
+ * A background job purges rows older than RECENT_OP_ID_TTL_HOURS (24h).
+ */
+export const recentOpIds = pgTable(
+  "recent_op_ids",
+  {
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+    opId: text("op_id").notNull(),
+    /** The HTTP status and JSON body of the original response, stored verbatim. */
+    result: text("result").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workspaceId, t.opId] }),
+    index("recent_op_ids_created_at_idx").on(t.createdAt),
+  ]
+)
 
 // ---- Staged import files (part of an import session) ----
 

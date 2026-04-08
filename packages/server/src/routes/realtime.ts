@@ -19,6 +19,7 @@ import {
   encodeDocState,
   persistUpdate,
   maybeCompact,
+  DocCorruptedError,
 } from "../services/yjsService.js"
 import {
   PROTOCOL_VERSION,
@@ -65,6 +66,16 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         try {
           await persistUpdate(docId, update)
         } catch (err) {
+          if (err instanceof DocCorruptedError) {
+            // Tell the client their edit was refused. Don't broadcast — everyone else
+            // would get a phantom update that wasn't persisted.
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "DOC_CORRUPTED",
+              message: err.message,
+            }))
+            return
+          }
           logger.error("persistUpdate failed", { docId, err: String(err) })
           return
         }
@@ -253,7 +264,17 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         logger.debug("sending state frame", { docId: msg.docId, size: frame.length })
         ws.raw.send(frame)
       } catch (err) {
-        logger.error("failed to send doc state", { docId: msg.docId, err: String(err) })
+        if (err instanceof DocCorruptedError) {
+          // Surface the corruption clearly instead of silently serving no state —
+          // which would look identical to a fresh empty doc to the client.
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "DOC_CORRUPTED",
+            message: err.message,
+          }))
+        } else {
+          logger.error("failed to send doc state", { docId: msg.docId, err: String(err) })
+        }
       }
       return
     }

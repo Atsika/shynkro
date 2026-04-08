@@ -7,6 +7,7 @@ import type { RestClient } from "../api/restClient"
 import type { StateDb } from "../state/stateDb"
 import type { FileWatcher } from "../sync/fileWatcher"
 import { log } from "../logger"
+import { atomicWriteFileSync } from "../text/atomicWrite"
 
 const IS_WINDOWS = os.platform() === "win32"
 
@@ -53,10 +54,10 @@ export class BinarySync {
 
   async download(fileId: FileId, localPath: string, workspaceId: WorkspaceId): Promise<void> {
     const { data, hash, mode } = await this.restClient.downloadBlob(workspaceId, fileId)
-    const dir = path.dirname(localPath)
-    fs.mkdirSync(dir, { recursive: true })
+    // Atomic write: a crash mid-transfer leaves the target untouched. For a 1 GB
+    // pcap that's the difference between a retry and silent corruption.
     this.fileWatcher.addWriteTag(localPath)
-    fs.writeFileSync(localPath, data)
+    atomicWriteFileSync(localPath, data)
     this.stateDb.updateBinaryHash(fileId, hash)
     // Persist whatever mode the server returned (if any) so subsequent uploads from
     // this client also know the canonical bits.

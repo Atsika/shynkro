@@ -9,6 +9,7 @@ import type { FileWatcher } from "../sync/fileWatcher"
 import { ConflictManager } from "../conflict/conflictManager"
 import { log } from "../logger"
 import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../text/textNormalize"
+import { atomicWriteFileSync } from "../text/atomicWrite"
 
 /**
  * Convert an editor offset (which counts `\r\n` as 2 characters when the document's
@@ -56,6 +57,16 @@ interface DocEntry {
   conflictServerDoc: Y.Doc | null
   /** The server text when the conflict was started — used to detect server changes during resolution. */
   conflictOriginalServerText: string | null
+  /**
+   * Frames that arrived during the narrow window of applyFinalText where
+   * `conflictServerDoc` has been destroyed but `pendingConflict` is still true.
+   * Drained into `yDoc` at the end of applyFinalText, before `pendingConflict` is
+   * cleared. Ensures no server update can slip through and silently overwrite
+   * the user's resolution even if a future refactor introduces a yield point
+   * in the conflict tail (today the window is zero ticks, but this is cheap
+   * insurance against regression).
+   */
+  conflictBufferedFrames: Uint8Array[] | null
 }
 
 interface BackgroundEntry {
@@ -217,6 +228,7 @@ export class YjsBridge {
       pendingConflict: hasSuspendedConflict || !!(bgEntry?.pendingConflict),
       conflictServerDoc: null,
       conflictOriginalServerText: null,
+      conflictBufferedFrames: null,
     }
     this.docs.set(docId, entry)
 
@@ -296,14 +308,38 @@ export class YjsBridge {
 
   setRole(role: Role): void {
     const wasViewer = this.currentRole === "viewer"
+    const wasEditor = this.currentRole !== "viewer"
     this.currentRole = role
     if (role === "viewer") {
-      const editor = vscode.window.activeTextEditor
-      if (editor && this.isTrackedPath(editor.document.uri.fsPath)) {
-        vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
+      // Lock every visible tracked editor — session-readonly is per-document, so
+      // iterating visible editors catches split-view and background tabs that
+      // would otherwise stay writable and silently drop edits server-side.
+      this.lockAllTrackedEditors()
+
+      if (wasEditor) {
+        // Critical: between "server applied demotion" and "client received the
+        // permissionChanged message", the user may have typed edits that the
+        // server silently rejected (realtime.ts:54 viewer check). The local
+        // Y.Doc still holds those edits — if we don't resync, handleLocalEdit's
+        // revert-to-yDoc-truth would restore the phantom edits and the user
+        // would think their work saved.
+        //
+        // Re-subscribing forces the server to send a fresh WS_BINARY_YJS_STATE
+        // frame; handleBinaryFrame will overwrite the local Y.Doc with the
+        // authoritative server state and push it into the editor. Any unsent
+        // edits are discarded (correct behavior for a demoted viewer).
+        for (const [docId, entry] of this.docs) {
+          entry.hasReceivedState = false
+          this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: entry.workspaceId, docId: docId as DocId })
+        }
+        // Surface the demotion in the status bar so the user actually notices —
+        // a transient toast is easy to dismiss and the old code had no persistent
+        // indicator.
+        this.setViewerStatusBar(true)
       }
     } else {
       this.permissionPopupShown = false
+      this.setViewerStatusBar(false)
       if (wasViewer) {
         // Unlock ALL tracked visible editors — session-readonly is per-document so we must
         // temporarily focus each locked tab and run the command, then restore focus.
@@ -315,6 +351,44 @@ export class YjsBridge {
         }
       }
     }
+  }
+
+  /** Status bar item surfacing the viewer-only indicator. Lazily created. */
+  private viewerStatusBarItem: vscode.StatusBarItem | null = null
+  private setViewerStatusBar(visible: boolean): void {
+    if (visible) {
+      if (!this.viewerStatusBarItem) {
+        this.viewerStatusBarItem = vscode.window.createStatusBarItem(
+          vscode.StatusBarAlignment.Left,
+          50
+        )
+        this.viewerStatusBarItem.text = "$(eye) Shynkro: Viewer (read-only)"
+        this.viewerStatusBarItem.tooltip =
+          "You are a viewer in this workspace — your edits are NOT saved to the server. Request editor access from the workspace owner."
+        this.viewerStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground")
+      }
+      this.viewerStatusBarItem.show()
+    } else {
+      this.viewerStatusBarItem?.hide()
+    }
+  }
+
+  /** Inverse of unlockAllTrackedEditors — session-readonly every visible tracked editor. */
+  private lockAllTrackedEditors(): void {
+    const toLock = vscode.window.visibleTextEditors.filter(
+      (e) => e.document.uri.scheme === "file" && this.isTrackedPath(e.document.uri.fsPath)
+    )
+    if (toLock.length === 0) return
+    const original = vscode.window.activeTextEditor
+    ;(async () => {
+      for (const editor of toLock) {
+        await vscode.window.showTextDocument(editor.document, { preserveFocus: false, preview: false })
+        await vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
+      }
+      if (original) {
+        await vscode.window.showTextDocument(original.document, { preserveFocus: false, preview: false })
+      }
+    })().catch(() => {})
   }
 
   setUsername(name: string): void {
@@ -354,8 +428,98 @@ export class YjsBridge {
     if (!entry) return
     this.wsManager.sendJson({ type: "unsubscribeDoc", docId })
     entry.yDoc.destroy()
+    entry.conflictServerDoc?.destroy()
     this.docs.delete(docId)
     this.updateHandlers.delete(docId)
+  }
+
+  /**
+   * Called when a file has been deleted (locally by the user, or remotely via WS
+   * broadcast). Tears down the Y.Doc subscription, closes the editor tab, and
+   * prompts the user to save a local copy if they had unsaved changes and the
+   * deletion was initiated remotely.
+   *
+   * Previously, the editor stayed open and editable after deletion — the user
+   * could keep typing into a doc that no longer existed on the server, with every
+   * keystroke silently dropped. This ensures the in-memory state matches the
+   * wire state after a delete, for both tabs and Y.Doc subscriptions.
+   */
+  async handleFileDeleted(absPath: string, opts: { remote: boolean; deletedBy?: string }): Promise<void> {
+    // Find the docId from either active docs or background docs by path match.
+    let matchedDocId: string | null = null
+    let matchedEntry: DocEntry | null = null
+    for (const [docId, entry] of this.docs) {
+      if (entry.filePath === absPath) {
+        matchedDocId = docId
+        matchedEntry = entry
+        break
+      }
+    }
+    if (!matchedDocId) {
+      for (const [docId, bg] of this.backgroundDocs) {
+        if (bg.filePath === absPath) {
+          matchedDocId = docId
+          // Clean up the background entry now — no editor to close for background docs.
+          if (bg.writeTimer) clearTimeout(bg.writeTimer)
+          this.wsManager.sendJson({ type: "unsubscribeDoc", docId: docId as DocId })
+          bg.yDoc.destroy()
+          this.backgroundDocs.delete(docId)
+          log.appendLine(`[yjsBridge] closed background doc for deleted file ${path.basename(absPath)}`)
+          return
+        }
+      }
+    }
+    if (!matchedDocId || !matchedEntry) return
+
+    // Find any live VS Code tab for this path and close it. Unsaved local edits
+    // trigger a prompt only when the delete came from another collaborator — a
+    // user deleting their own file already intended to discard unsaved changes.
+    const doc = matchedEntry.editor.document
+    const isDirty = !doc.isClosed && doc.isDirty
+    if (opts.remote && isDirty) {
+      const who = opts.deletedBy ? ` by ${opts.deletedBy}` : ""
+      const choice = await vscode.window.showWarningMessage(
+        `Shynkro: "${path.basename(absPath)}" was deleted${who}, but you have unsaved changes. Save a local copy?`,
+        { modal: true },
+        "Save Local Copy",
+        "Discard"
+      )
+      if (choice === "Save Local Copy") {
+        // Write the dirty editor content to a sibling .recovered file so it
+        // isn't lost when the editor tab is force-closed.
+        const recoveredPath = `${absPath}.recovered-${Date.now()}`
+        try {
+          fs.writeFileSync(recoveredPath, doc.getText(), "utf-8")
+          vscode.window.showInformationMessage(`Shynkro: saved recovery copy at ${path.basename(recoveredPath)}`)
+        } catch (err) {
+          log.appendLine(`[yjsBridge] failed to write recovery copy ${recoveredPath}: ${err}`)
+        }
+      }
+    }
+
+    // Tear down the Y.Doc subscription and associated state. closeDoc handles
+    // the unsubscribe + destroy; we also clean up any pending conflict state
+    // that references this doc so the conflict view no longer shows it.
+    this.closeDoc(matchedDocId as DocId)
+    this.conflictManager.clear(matchedDocId)
+
+    // Close the editor tab if it is still open. VS Code's tabGroups API takes
+    // a Tab or readonly Tab[] — we look up the tab matching this doc's URI.
+    try {
+      const uri = doc.uri
+      const tabsToClose: vscode.Tab[] = []
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          const input = tab.input as { uri?: vscode.Uri } | undefined
+          if (input?.uri?.toString() === uri.toString()) tabsToClose.push(tab)
+        }
+      }
+      if (tabsToClose.length > 0) {
+        await vscode.window.tabGroups.close(tabsToClose, true)
+      }
+    } catch (err) {
+      log.appendLine(`[yjsBridge] failed to close tabs for deleted file ${path.basename(absPath)}: ${err}`)
+    }
   }
 
   /**
@@ -453,9 +617,14 @@ export class YjsBridge {
               log.appendLine(`[yjsBridge] updated conflictServerDoc from WS_BINARY_YJS_STATE for ${path.basename(entry.filePath)}`)
               return
             }
-            // pendingConflict=true but no conflictServerDoc — conflict was just resolved
-            // (applyFinalText runs async and may still be in flight). Drop the state frame;
-            // applyFinalText will clear pendingConflict when done.
+            // pendingConflict=true but no conflictServerDoc — this is the tail of
+            // applyFinalText, between `conflictServerDoc = null` and `pendingConflict = false`.
+            // Buffer the frame and drain it when applyFinalText finishes, rather than
+            // dropping it silently. Prevents a future async refactor from turning this
+            // into a silent-overwrite path.
+            if (!entry.conflictBufferedFrames) entry.conflictBufferedFrames = []
+            entry.conflictBufferedFrames.push(frame.data)
+            log.appendLine(`[yjsBridge] buffered state frame during conflict tail for ${path.basename(entry.filePath)}`)
             return
           }
 
@@ -500,16 +669,34 @@ export class YjsBridge {
             })
           }
         } else {
-          // Incremental update — apply and push to editor
+          // Incremental update path.
+          if (entry.pendingConflict) {
+            if (entry.conflictServerDoc) {
+              // Apply to the shadow doc so the conflict UI stays live, AND to the
+              // real yDoc so on-screen text stays current. The fresh yDoc built by
+              // applyFinalText will be seeded from conflictServerDoc, so this is
+              // idempotent with respect to eventual state.
+              Y.applyUpdate(entry.yDoc, frame.data, "remote")
+              Y.applyUpdate(entry.conflictServerDoc, frame.data, "remote")
+              const newServerText = entry.conflictServerDoc.getText("content").toString()
+              entry.conflictOriginalServerText = newServerText
+              this.conflictManager.updateServerText(frame.docId, newServerText).catch(() => {})
+              // Editor stays in conflict-markers view while pendingConflict — do not
+              // push the update through applyDocToEditor (which would clobber markers).
+              return
+            }
+            // Conflict tail window (same as state-frame path): buffer and drain
+            // at the end of applyFinalText. Keeps the fresh yDoc up-to-date with
+            // any remote updates that slipped in between destroy and rebuild.
+            if (!entry.conflictBufferedFrames) entry.conflictBufferedFrames = []
+            entry.conflictBufferedFrames.push(frame.data)
+            log.appendLine(`[yjsBridge] buffered update frame during conflict tail for ${path.basename(entry.filePath)}`)
+            return
+          }
+
+          // Normal (non-conflict) path — apply and push to editor.
           const before = entry.yDoc.getText("content").toString()
           Y.applyUpdate(entry.yDoc, frame.data, "remote")
-          // Keep the conflict shadow doc in sync and live-update the conflict UI
-          if (entry.pendingConflict && entry.conflictServerDoc) {
-            Y.applyUpdate(entry.conflictServerDoc, frame.data, "remote")
-            const newServerText = entry.conflictServerDoc.getText("content").toString()
-            entry.conflictOriginalServerText = newServerText
-            this.conflictManager.updateServerText(frame.docId, newServerText).catch(() => {})
-          }
           const after = entry.yDoc.getText("content").toString()
           if (before !== after) {
             log.appendLine(`[yjsBridge] update applied ${path.basename(entry.filePath)}: ${before.length} → ${after.length}`)
@@ -729,6 +916,25 @@ export class YjsBridge {
       })
     }
 
+    // Drain any frames that were buffered during the conflict tail window
+    // (between conflictServerDoc destroy and pendingConflict clear). Must happen
+    // BEFORE clearing the flag — otherwise a concurrent handleBinaryFrame could
+    // mistake the doc for "normal mode" and step on the drain. Today the drain
+    // is almost always empty (the window is zero ticks in sync code), but it
+    // means future async refactors can't silently drop updates.
+    if (entry.conflictBufferedFrames && entry.conflictBufferedFrames.length > 0) {
+      for (const bufferedData of entry.conflictBufferedFrames) {
+        try {
+          Y.applyUpdate(entry.yDoc, bufferedData, "remote")
+        } catch (err) {
+          log.appendLine(`[yjsBridge] buffered frame replay error: ${err}`)
+        }
+      }
+      log.appendLine(`[yjsBridge] drained ${entry.conflictBufferedFrames.length} buffered conflict-tail frame(s) for ${path.basename(entry.filePath)}`)
+      entry.conflictBufferedFrames = null
+      this.applyDocToEditor(entry)
+    }
+
     // Resolution is complete. Clear the gate so normal incremental updates resume.
     // Any concurrent server changes will arrive as WS_BINARY_YJS_UPDATE frames and
     // be applied normally — no re-subscribe needed (and it would race against the
@@ -812,9 +1018,8 @@ export class YjsBridge {
       const bom = !!row.hasBom
       const encoded = encodeTextForDisk(lfText, eol, bom)
       try {
-        fs.mkdirSync(path.dirname(entry.filePath), { recursive: true })
         this.fileWatcher.addWriteTag(entry.filePath)
-        fs.writeFileSync(entry.filePath, encoded, "utf-8")
+        atomicWriteFileSync(entry.filePath, encoded, { encoding: "utf-8" })
         log.appendLine(`[yjsBridge] background wrote ${path.basename(entry.filePath)} (${lfText.length} chars, eol=${eol}${bom ? ", bom" : ""})`)
       } catch (err) {
         log.appendLine(`[yjsBridge] background write error for ${path.basename(entry.filePath)}: ${err}`)
@@ -1178,6 +1383,8 @@ export class YjsBridge {
     this.remoteCursors.clear()
     this.docs.clear()
     this.backgroundDocs.clear()
+    this.viewerStatusBarItem?.dispose()
+    this.viewerStatusBarItem = null
     this.disposables.forEach((d) => d.dispose())
   }
 }

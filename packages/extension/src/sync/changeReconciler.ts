@@ -18,6 +18,7 @@ import type { StateDb } from "../state/stateDb"
 import type { FileWatcher } from "./fileWatcher"
 import type { BinarySync } from "../binary/binarySync"
 import { encodeTextForDisk, defaultEol } from "../text/textNormalize"
+import { atomicWriteFileSync } from "../text/atomicWrite"
 
 export class ChangeReconciler {
   private pollTimer: NodeJS.Timeout | null = null
@@ -134,7 +135,7 @@ export class ChangeReconciler {
         const bom = !!row?.hasBom
         const encoded = encodeTextForDisk(content, eol, bom)
         this.fileWatcher.addWriteTag(localPath)
-        fs.writeFileSync(localPath, encoded, "utf-8")
+        atomicWriteFileSync(localPath, encoded, { encoding: "utf-8" })
         // Persist the format we just used so subsequent reads stay consistent.
         if (row && row.eolStyle === null) {
           this.stateDb.setTextFormat(msg.fileId, eol, bom)
@@ -204,6 +205,10 @@ export class ChangeReconciler {
     const localPath = safeJoin(this.workspaceRoot, msg.path)
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${msg.path}`); return }
     this.fileWatcher.addWriteTag(localPath)
+    // Signal the Yjs bridge so any open editor for this file gets torn down
+    // (closes the tab, prompts for recovery if dirty, unsubscribes the doc).
+    // Fire before removing the file so the bridge's lookup by path still works.
+    this._onRemoteFileDeleted.fire({ absPath: localPath })
     try {
       // rmSync handles files, directories (recursive), and is a no-op when force:true + path missing
       fs.rmSync(localPath, { recursive: true, force: true })
@@ -214,6 +219,10 @@ export class ChangeReconciler {
     this.stateDb.purgeFile(msg.fileId)
     this.stateDb.setRevision(this.workspaceId, msg.revision)
   }
+
+  /** Fires when a file was deleted by another collaborator (via WS or poll). */
+  private readonly _onRemoteFileDeleted = new vscode.EventEmitter<{ absPath: string }>()
+  readonly onRemoteFileDeleted = this._onRemoteFileDeleted.event
 
   private async applyBinaryUpdated(msg: BinaryUpdatedMessage): Promise<void> {
     const row = this.stateDb.getFileById(msg.fileId)
@@ -273,5 +282,6 @@ export class ChangeReconciler {
     this.stopPolling()
     this.disposables.forEach((d) => d.dispose())
     this._onTextFileRegistered.dispose()
+    this._onRemoteFileDeleted.dispose()
   }
 }

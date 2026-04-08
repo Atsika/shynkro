@@ -36,6 +36,11 @@ export class ApiError extends Error {
   }
 }
 
+/** Build the X-Shynkro-Op-Id header payload, or undefined when no opId is present. */
+function opIdHeaders(opId: string | undefined): Record<string, string> | undefined {
+  return opId ? { "X-Shynkro-Op-Id": opId } : undefined
+}
+
 export class RestClient {
   private baseUrl = "http://localhost:3000"
 
@@ -158,14 +163,19 @@ export class RestClient {
   }
 
   // Files
-  createFile(workspaceId: WorkspaceId, body: CreateFileBody): Promise<FileEntry> {
-    return this.request("POST", `/api/v1/workspaces/${workspaceId}/files`, body)
+  //
+  // The optional `opId` parameter is the client-generated UUID from a pending_ops
+  // queue entry; when present it is forwarded as X-Shynkro-Op-Id so the server
+  // can dedupe a replay after an extension crash between "applied" and "acked".
+  // Direct online ops pass no opId — they can't replay.
+  createFile(workspaceId: WorkspaceId, body: CreateFileBody, opId?: string): Promise<FileEntry> {
+    return this.request("POST", `/api/v1/workspaces/${workspaceId}/files`, body, opIdHeaders(opId))
   }
-  renameFile(workspaceId: WorkspaceId, fileId: FileId, body: RenameFileBody): Promise<void> {
-    return this.request("PATCH", `/api/v1/workspaces/${workspaceId}/files/${fileId}`, body)
+  renameFile(workspaceId: WorkspaceId, fileId: FileId, body: RenameFileBody, opId?: string): Promise<void> {
+    return this.request("PATCH", `/api/v1/workspaces/${workspaceId}/files/${fileId}`, body, opIdHeaders(opId))
   }
-  deleteFile(workspaceId: WorkspaceId, fileId: FileId): Promise<void> {
-    return this.request("DELETE", `/api/v1/workspaces/${workspaceId}/files/${fileId}`)
+  deleteFile(workspaceId: WorkspaceId, fileId: FileId, opId?: string): Promise<void> {
+    return this.request("DELETE", `/api/v1/workspaces/${workspaceId}/files/${fileId}`, undefined, opIdHeaders(opId))
   }
   getFile(workspaceId: WorkspaceId, fileId: FileId): Promise<FileEntry> {
     return this.request("GET", `/api/v1/workspaces/${workspaceId}/files/${fileId}`)

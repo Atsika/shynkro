@@ -1,17 +1,21 @@
 import * as fs from "fs"
 import * as path from "path"
 import { DEFAULT_IGNORE, SHYNKROIGNORE } from "./constants"
+import { SHYNKRO_TMP_PREFIX } from "./text/atomicWrite"
 
 /**
  * Build an ignore function from DEFAULT_IGNORE + optional .shynkroignore file.
  * The returned function takes a path relative to root (always "/" separators)
  * and returns true if it should be excluded from sync.
+ *
+ * Also ignores in-flight atomic-write sidecars whose basename starts with
+ * SHYNKRO_TMP_PREFIX — these are created and renamed away by atomicWriteFileSync.
  */
 export function buildIgnoreMatcher(root: string): (relPath: string) => boolean {
   const patterns = loadShynkroIgnore(root)
   return (relPath: string) => {
     const parts = relPath.split("/")
-    if (parts.some((p) => DEFAULT_IGNORE.has(p))) return true
+    if (parts.some((p) => DEFAULT_IGNORE.has(p) || p.startsWith(SHYNKRO_TMP_PREFIX))) return true
     for (const pat of patterns) {
       if (matchIgnorePattern(pat, relPath, parts)) return true
     }
