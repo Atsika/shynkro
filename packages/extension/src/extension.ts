@@ -21,7 +21,7 @@ import { executeClone, executeJoin } from "./workspace/cloneCommand"
 import { executeInvite } from "./workspace/inviteCommand"
 import { releaseLock } from "./lock/lockFile"
 import { acquireLock } from "./lock/lockFile"
-import { drainPendingOps } from "./sync/opQueue"
+import { drainPendingOps, serializePendingOpsToRecovery } from "./sync/opQueue"
 import { PresenceView, PresenceItem } from "./views/presenceView"
 import { ActionsView } from "./views/actionsView"
 import { ConflictView } from "./views/conflictView"
@@ -460,7 +460,8 @@ async function startSync(
   const dbPath = path.join(shynkroDir, "state.db")
   log.appendLine(`[sync] opening stateDb at ${dbPath}`)
   stateDb = makeStateDb(dbPath)
-  wsManager = new WsManager(authService!, statusBar!)
+  // Pass stateDb so pending Yjs frames persist across extension reloads (B2).
+  wsManager = new WsManager(authService!, statusBar!, stateDb)
   fileWatcher = new FileWatcher(workspaceRoot, config.workspaceId, stateDb, restClient, wsManager)
   const binarySync = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher)
   changeReconciler = new ChangeReconciler(
@@ -506,6 +507,22 @@ async function startSync(
     })
   )
 
+  // Wire file deletions to the Yjs bridge so open editor tabs get closed and
+  // their Yjs doc subscriptions torn down. Without this, the editor stays open
+  // and every subsequent keystroke is silently dropped by the server.
+  context.subscriptions.push(
+    fileWatcher.onFileDeleted(({ absPath }) => {
+      yjsBridge?.handleFileDeleted(absPath, { remote: false }).catch((err) =>
+        log.appendLine(`[sync] handleFileDeleted (local) error: ${err}`)
+      )
+    }),
+    changeReconciler.onRemoteFileDeleted(({ absPath }) => {
+      yjsBridge?.handleFileDeleted(absPath, { remote: true }).catch((err) =>
+        log.appendLine(`[sync] handleFileDeleted (remote) error: ${err}`)
+      )
+    })
+  )
+
   // Helper: bridge to editor if open, otherwise subscribe as background
   const bridgeOrBackground = (fsPath: string) => {
     for (const editor of vscode.window.visibleTextEditors) {
@@ -545,8 +562,38 @@ async function startSync(
           if (choice === "Create New Workspace") vscode.commands.executeCommand("shynkro.init")
         })
       } else if (msg.type === "memberRemoved") {
-        vscode.window.showWarningMessage("Shynkro: you have been removed from this workspace. Sync stopped.")
-        stopSync()
+        // Try one last drain so any queued offline ops land on the server before
+        // the membership is fully revoked. Whatever the server refuses (or whatever
+        // fails transiently) gets serialized to a recovery JSON the user can open
+        // later — prevents silent loss of unsynced work on abrupt removal.
+        (async () => {
+          if (stateDb) {
+            try {
+              await drainPendingOps(stateDb, restClient, config.workspaceId, workspaceRoot)
+            } catch (err) {
+              log.appendLine(`[sync] memberRemoved final drain error: ${err}`)
+            }
+            const recoveryPath = serializePendingOpsToRecovery(stateDb, workspaceRoot)
+            if (recoveryPath) {
+              vscode.window.showWarningMessage(
+                `Shynkro: you have been removed from this workspace. Unsynced changes were saved to ${path.basename(recoveryPath)}.`,
+                "Reveal Recovery File"
+              ).then((choice) => {
+                if (choice === "Reveal Recovery File") {
+                  vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(recoveryPath))
+                }
+              })
+            } else {
+              vscode.window.showWarningMessage("Shynkro: you have been removed from this workspace. Sync stopped.")
+            }
+          } else {
+            vscode.window.showWarningMessage("Shynkro: you have been removed from this workspace. Sync stopped.")
+          }
+          stopSync()
+        })().catch((err) => {
+          log.appendLine(`[sync] memberRemoved handler error: ${err}`)
+          stopSync()
+        })
       } else if (msg.type === "permissionChanged") {
         if (msg.userId === wsManager!.userId) {
           yjsBridge?.setRole(msg.role)

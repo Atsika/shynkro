@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import * as Y from "yjs"
 import { eq, sql } from "drizzle-orm"
 import { db } from "../db/index.js"
@@ -5,6 +6,47 @@ import { collaborativeDocs, yjsUpdates } from "../db/schema.js"
 import { logger } from "../lib/logger.js"
 
 const COMPACTION_THRESHOLD = 500
+
+/**
+ * Thrown when a Yjs document can no longer be trusted — either the stored snapshot
+ * hash does not match the snapshot bytes, or applying the snapshot as a Yjs update
+ * fails. Signals callers to surface an error to the client instead of silently
+ * handing them a fresh empty Y.Doc (which, if edited, would overwrite real content
+ * on the next `persistUpdate` or `maybeCompact`).
+ */
+export class DocCorruptedError extends Error {
+  readonly code = "DOC_CORRUPTED"
+  constructor(public readonly docId: string, cause?: unknown) {
+    super(`Collaborative document ${docId} is corrupted and cannot be loaded; restore from backup before editing`)
+    if (cause !== undefined) {
+      // Keep the original Error stack/context so ops can diagnose without server-log archaeology.
+      ;(this as { cause?: unknown }).cause = cause
+    }
+    this.name = "DocCorruptedError"
+  }
+}
+
+function sha256Hex(data: Uint8Array | Buffer): string {
+  return createHash("sha256").update(data).digest("hex")
+}
+
+/**
+ * Persist the corruption flag and log a loud error. Separate helper so every
+ * code path that detects corruption surfaces it the same way.
+ */
+async function markCorrupted(docId: string, reason: string, cause?: unknown): Promise<void> {
+  logger.error("doc corrupted — halting writes", { docId, reason, cause: cause !== undefined ? String(cause) : undefined })
+  try {
+    await db
+      .update(collaborativeDocs)
+      .set({ corrupted: true })
+      .where(eq(collaborativeDocs.id, docId))
+  } catch (err) {
+    // If we can't even write the flag, the DB is in worse shape than the doc.
+    // Log loudly; the throw that follows will still abort the current operation.
+    logger.error("failed to persist corrupted flag", { docId, err: String(err) })
+  }
+}
 
 export async function loadDoc(docId: string): Promise<Y.Doc> {
   const [docRow] = await db
@@ -14,21 +56,36 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
     .limit(1)
 
   if (!docRow) throw new Error(`Doc not found: ${docId}`)
+  if (docRow.corrupted) throw new DocCorruptedError(docId)
 
   const doc = new Y.Doc()
 
-  // Apply snapshot first
+  // Apply snapshot first, with integrity verification.
   if (docRow.snapshot) {
+    // snapshotHash is populated alongside the snapshot itself by maybeCompact.
+    // Docs compacted before B1 will have a non-null snapshot with a null hash;
+    // tolerate that by skipping the hash check but still trusting applyUpdate
+    // as the final gate. On next compaction, the hash is written and future
+    // loads are fully protected.
+    if (docRow.snapshotHash !== null) {
+      const actual = sha256Hex(docRow.snapshot)
+      if (actual !== docRow.snapshotHash) {
+        await markCorrupted(docId, "snapshot hash mismatch", { expected: docRow.snapshotHash, actual })
+        throw new DocCorruptedError(docId)
+      }
+    }
     try {
       Y.applyUpdate(doc, docRow.snapshot)
     } catch (err) {
-      logger.error("snapshot corrupt", { docId, err: String(err) })
-      // Return empty doc — critical but recoverable
-      return new Y.Doc()
+      await markCorrupted(docId, "snapshot apply failed", err)
+      throw new DocCorruptedError(docId, err)
     }
   }
 
-  // Replay updates since snapshot
+  // Replay updates since snapshot. A single corrupt update is tolerated —
+  // Yjs is resilient to missing updates (the CRDT converges regardless) and
+  // the remaining updates may carry recoverable state. Only the snapshot is
+  // considered load-bearing for halt-on-corrupt.
   const updates = await db
     .select()
     .from(yjsUpdates)
@@ -39,7 +96,7 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
     try {
       Y.applyUpdate(doc, update.data)
     } catch (err) {
-      logger.error("update corrupt", { docId, updateId: update.id, err: String(err) })
+      logger.error("yjs update corrupt (skipped)", { docId, updateId: update.id, err: String(err) })
     }
   }
 
@@ -47,6 +104,16 @@ export async function loadDoc(docId: string): Promise<Y.Doc> {
 }
 
 export async function persistUpdate(docId: string, update: Uint8Array): Promise<void> {
+  // Refuse writes on docs that have already been flagged corrupted — prevents an
+  // edit made against a "recovered" empty doc from becoming the new source of truth.
+  const [docRow] = await db
+    .select({ corrupted: collaborativeDocs.corrupted })
+    .from(collaborativeDocs)
+    .where(eq(collaborativeDocs.id, docId))
+    .limit(1)
+  if (!docRow) throw new Error(`Doc not found: ${docId}`)
+  if (docRow.corrupted) throw new DocCorruptedError(docId)
+
   await db.insert(yjsUpdates).values({
     docId,
     data: Buffer.from(update),
@@ -68,16 +135,24 @@ export async function maybeCompact(docId: string): Promise<void> {
 
   try {
     const doc = await loadDoc(docId)
-    const snapshot = Buffer.from(Y.encodeStateAsUpdate(doc))
+    const snapshotBytes = Y.encodeStateAsUpdate(doc)
+    const snapshot = Buffer.from(snapshotBytes)
+    const snapshotHash = sha256Hex(snapshotBytes)
 
     await db.transaction(async (tx) => {
       await tx
         .update(collaborativeDocs)
-        .set({ snapshot, snapshotAt: new Date() })
+        .set({ snapshot, snapshotHash, snapshotAt: new Date() })
         .where(eq(collaborativeDocs.id, docId))
       await tx.delete(yjsUpdates).where(eq(yjsUpdates.docId, docId))
     })
   } catch (err) {
+    // A DocCorruptedError from loadDoc is already logged and persisted by markCorrupted.
+    // Do NOT clobber an already-corrupted doc with an empty snapshot — just bail.
+    if (err instanceof DocCorruptedError) {
+      logger.error("compaction skipped — doc already corrupted", { docId })
+      return
+    }
     logger.error("compaction failed", { docId, err: String(err) })
   }
 }

@@ -7,7 +7,7 @@ import { uuid } from "../utils.js"
 import { requireMember } from "../lib/authz.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
 import { recordChange } from "../lib/changeLog.js"
-import { getPlainText } from "../services/yjsService.js"
+import { getPlainText, DocCorruptedError } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { zipSync } from "fflate"
 
@@ -347,16 +347,29 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
 
       const zipEntries: Record<string, [Uint8Array, { level: 0 }]> = {}
 
-      for (const file of files) {
-        if (file.kind === "folder") {
-          zipEntries[file.path + "/"] = [new Uint8Array(0), { level: 0 }]
-        } else if (file.kind === "text" && file.docId) {
-          const text = await getPlainText(file.docId)
-          zipEntries[file.path] = [new TextEncoder().encode(text), { level: 0 }]
-        } else if (file.kind === "binary" && file.binaryHash) {
-          const data = await storage.get(file.binaryHash)
-          zipEntries[file.path] = [data, { level: 0 }]
+      try {
+        for (const file of files) {
+          if (file.kind === "folder") {
+            zipEntries[file.path + "/"] = [new Uint8Array(0), { level: 0 }]
+          } else if (file.kind === "text" && file.docId) {
+            const text = await getPlainText(file.docId)
+            zipEntries[file.path] = [new TextEncoder().encode(text), { level: 0 }]
+          } else if (file.kind === "binary" && file.binaryHash) {
+            const data = await storage.get(file.binaryHash)
+            zipEntries[file.path] = [data, { level: 0 }]
+          }
         }
+      } catch (err) {
+        // Refuse to emit a partial export — a silently-empty entry in the archive
+        // would let a pentester think they have their data when they actually lost
+        // the content of a corrupted doc. Bail loudly with a clear error code.
+        if (err instanceof DocCorruptedError) {
+          return status(503, {
+            code: "DOC_CORRUPTED",
+            message: err.message,
+          })
+        }
+        throw err
       }
 
       const zipBuffer = Buffer.from(zipSync(zipEntries))

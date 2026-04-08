@@ -10,6 +10,7 @@ import { realtimeRoutes } from "./routes/realtime.js"
 import { runMigrations, closeDb } from "./db/index.js"
 import { expireImportSessions } from "./jobs/expireImportSessions.js"
 import { pruneChangeLogs } from "./jobs/pruneChangeLogs.js"
+import { purgeRecentOpIds } from "./jobs/purgeRecentOpIds.js"
 import { closeAllConnections } from "./services/realtimeState.js"
 import { setupGracefulShutdown } from "./lib/shutdown.js"
 import { logger } from "./lib/logger.js"
@@ -20,9 +21,11 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10)
 await runMigrations()
 await expireImportSessions()
 await pruneChangeLogs()
+await purgeRecentOpIds()
 const jobInterval = setInterval(() => {
   expireImportSessions().catch((err) => logger.error("expireImportSessions failed", { err: String(err) }))
   pruneChangeLogs().catch((err) => logger.error("pruneChangeLogs failed", { err: String(err) }))
+  purgeRecentOpIds().catch((err) => logger.error("purgeRecentOpIds failed", { err: String(err) }))
 }, 5 * 60 * 1000)
 
 const app = new Elysia()

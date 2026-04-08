@@ -9,13 +9,14 @@ import {
 } from "../db/schema.js"
 import { withAuth } from "../middleware/auth.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
-import { getPlainText, prepareDocUpdate } from "../services/yjsService.js"
+import { getPlainText, prepareDocUpdate, DocCorruptedError } from "../services/yjsService.js"
 import { uuid, isValidFilePath } from "../utils.js"
 import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { requireMember } from "../lib/authz.js"
 import { recordChange } from "../lib/changeLog.js"
 import { createStorageBackend } from "../storage/index.js"
 import { logger } from "../lib/logger.js"
+import { readIdempotencyCache, writeIdempotencyCache, getOpIdHeader } from "../lib/idempotency.js"
 
 const storage = createStorageBackend()
 
@@ -45,7 +46,13 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
   // POST /api/v1/workspaces/:id/files
   .post(
     "/",
-    async ({ params, body, user }) => {
+    async ({ params, body, user, headers }) => {
+      const opId = getOpIdHeader(headers)
+      if (opId) {
+        const cached = await readIdempotencyCache(params.id, opId)
+        if (cached) return status(cached.status, cached.body)
+      }
+
       const member = await requireMember(params.id, user.id)
       if (!member || member.role === "viewer") return status(403, { message: "Forbidden" })
 
@@ -142,7 +149,9 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
       await recordChange({ workspaceId: params.id, revision, type: "fileCreated", fileId, path: body.path, kind })
 
-      return { id: fileId, path: body.path, kind, docId, mode }
+      const response = { id: fileId, path: body.path, kind, docId, mode }
+      if (opId) await writeIdempotencyCache(params.id, opId, 200, response)
+      return response
     },
     {
       body: t.Object({
@@ -185,14 +194,30 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
     if (!file) return status(404, { message: "File not found" })
     if (file.kind !== "text" || !file.docId) return status(400, { message: "Not a text file" })
 
-    const text = await getPlainText(file.docId)
-    return new Response(text, { headers: { "Content-Type": "text/plain; charset=utf-8" } })
+    try {
+      const text = await getPlainText(file.docId)
+      return new Response(text, { headers: { "Content-Type": "text/plain; charset=utf-8" } })
+    } catch (err) {
+      if (err instanceof DocCorruptedError) {
+        return status(503, {
+          code: "DOC_CORRUPTED",
+          message: err.message,
+        })
+      }
+      throw err
+    }
   })
 
   // PATCH /api/v1/workspaces/:id/files/:fileId
   .patch(
     "/:fileId",
     async ({ params, body, user, headers }) => {
+      const opId = getOpIdHeader(headers)
+      if (opId) {
+        const cached = await readIdempotencyCache(params.id, opId)
+        if (cached) return status(cached.status, cached.body)
+      }
+
       const member = await requireMember(params.id, user.id)
       if (!member || member.role === "viewer") return status(403, { message: "Forbidden" })
 
@@ -269,13 +294,21 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
       await recordChange({ workspaceId: params.id, revision, type: "fileRenamed", fileId: params.fileId, path: body.path, oldPath })
 
-      return { fileId: params.fileId, path: body.path, revision }
+      const response = { fileId: params.fileId, path: body.path, revision }
+      if (opId) await writeIdempotencyCache(params.id, opId, 200, response)
+      return response
     },
     { body: t.Object({ path: t.String() }) }
   )
 
   // DELETE /api/v1/workspaces/:id/files/:fileId
-  .delete("/:fileId", async ({ params, user }) => {
+  .delete("/:fileId", async ({ params, user, headers }) => {
+    const opId = getOpIdHeader(headers)
+    if (opId) {
+      const cached = await readIdempotencyCache(params.id, opId)
+      if (cached) return status(cached.status, cached.body)
+    }
+
     const member = await requireMember(params.id, user.id)
     if (!member || member.role === "viewer") return status(403, { message: "Forbidden" })
 
@@ -313,5 +346,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
 
     await recordChange({ workspaceId: params.id, revision, type: "fileDeleted", fileId: params.fileId, path: file.path })
 
-    return { ok: true }
+    const response = { ok: true }
+    if (opId) await writeIdempotencyCache(params.id, opId, 200, response)
+    return response
   })

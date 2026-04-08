@@ -257,6 +257,11 @@ export class FileWatcher {
     // will re-delete it rather than restoring it locally.
     this.stateDb.deleteFile(row.fileId)
 
+    // Signal the Yjs bridge to tear down any in-flight subscription for this
+    // file so the editor can't keep typing into a doc the server no longer
+    // tracks. Local delete → no prompt needed, the user explicitly removed it.
+    this._onFileDeleted.fire({ absPath: uri.fsPath, remote: false })
+
     if (!this.wsManager.connected) {
       this.stateDb.enqueuePendingOp({ opType: "delete", path: relPath, fileId: row.fileId })
       log.appendLine(`[watcher] offline — queued delete ${relPath}`)
@@ -270,11 +275,16 @@ export class FileWatcher {
     }
   }
 
+  /** Fires when a tracked file is deleted locally or remotely. */
+  private readonly _onFileDeleted = new vscode.EventEmitter<{ absPath: string; remote: boolean }>()
+  readonly onFileDeleted = this._onFileDeleted.event
+
   dispose(): void {
     this.watcher?.dispose()
     this.disposables.forEach((d) => d.dispose())
     this._onBinaryChanged.dispose()
     this._onTextFileRegistered.dispose()
     this._onTextFileChangedExternally.dispose()
+    this._onFileDeleted.dispose()
   }
 }
