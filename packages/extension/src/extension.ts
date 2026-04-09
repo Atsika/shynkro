@@ -575,6 +575,32 @@ async function startSync(
   // Wire permission / membership / presence events
   context.subscriptions.push(
     wsManager.onServerMessage((msg) => {
+      if (msg.type === "serverShutdown") {
+        // The server is starting its graceful drain — we have ~10 s to flush
+        // anything pending. Best-effort drain of the op queue, then dump
+        // anything still queued to the recovery JSON so the user doesn't
+        // lose work to the imminent forced disconnect. The WS will close on
+        // its own once the drain window expires.
+        log.appendLine("[sync] received serverShutdown — flushing pending ops")
+        if (stateDb) {
+          drainPendingOps(stateDb, restClient, config.workspaceId, workspaceRoot)
+            .catch((err) => log.appendLine(`[sync] serverShutdown drain error: ${err}`))
+            .finally(() => {
+              if (!stateDb) return
+              const recoveryPath = serializePendingOpsToRecovery(stateDb, workspaceRoot)
+              if (recoveryPath) {
+                vscode.window.showWarningMessage(
+                  `Shynkro: server is shutting down. Unsynced changes were saved to ${path.basename(recoveryPath)}.`
+                )
+              } else {
+                vscode.window.showInformationMessage(
+                  "Shynkro: server is shutting down. Sync will resume on reconnect."
+                )
+              }
+            })
+        }
+        return
+      }
       if (msg.type === "workspaceDeleted") {
         stopSync()
         // Unlink the folder so reconnection attempts don't loop

@@ -120,3 +120,36 @@ export function closeAllConnections(): void {
   workspaceClients.clear()
   docClients.clear()
 }
+
+/**
+ * Total number of distinct WS clients currently subscribed to any workspace.
+ * Used by the graceful-shutdown drain to wait until all clients disconnect
+ * before force-closing.
+ */
+export function countActiveConnections(): number {
+  const seen = new Set<WsContext>()
+  for (const clients of workspaceClients.values()) {
+    for (const ctx of clients) seen.add(ctx)
+  }
+  return seen.size
+}
+
+/**
+ * Send a `serverShutdown` JSON frame to every connected client. Triggers the
+ * extension's pre-shutdown drain logic (flush pending op queue, dump anything
+ * unsent to .shynkro/recovery/, etc.) before the server force-closes the WS.
+ *
+ * Idempotent — safe to call multiple times. Failures per-client are logged
+ * but don't abort the broadcast.
+ */
+export function notifyAllShuttingDown(): void {
+  const payload = JSON.stringify({ type: "serverShutdown" })
+  const seen = new Set<WsContext>()
+  for (const clients of workspaceClients.values()) {
+    for (const ctx of clients) {
+      if (seen.has(ctx)) continue
+      seen.add(ctx)
+      try { ctx.ws.send(payload) } catch { /* client already gone */ }
+    }
+  }
+}
