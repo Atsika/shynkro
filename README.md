@@ -65,13 +65,21 @@ The server listens on `http://localhost:3000` by default.
 
 ### Environment variables
 
-| Variable               | Description                       | Default   |
-| ---------------------- | --------------------------------- | --------- |
-| `DATABASE_URL`         | PostgreSQL connection string      | —         |
-| `JWT_SECRET`           | Secret for signing access tokens  | —         |
-| `REFRESH_TOKEN_SECRET` | Secret for signing refresh tokens | —         |
-| `SHYNKRO_BLOB_DIR`     | Directory for binary file storage | `./blobs` |
-| `PORT`                 | HTTP port                         | `3000`    |
+| Variable                          | Description                                            | Default          |
+| --------------------------------- | ------------------------------------------------------ | ---------------- |
+| `DATABASE_URL`                    | PostgreSQL connection string                           | —                |
+| `JWT_SECRET`                      | Secret for signing access tokens                       | —                |
+| `REFRESH_TOKEN_SECRET`            | Secret for signing refresh tokens                      | —                |
+| `SHYNKRO_BLOB_DIR`                | Directory for binary file storage                      | `./blobs`        |
+| `PORT`                            | HTTP port                                              | `3000`           |
+| `SHYNKRO_DB_POOL_MAX`             | Max concurrent Postgres connections                    | `20`             |
+| `SHYNKRO_DB_IDLE_TIMEOUT`         | Seconds before idle connections are recycled           | `30`             |
+| `SHYNKRO_HTTP_DRAIN_MS`           | Graceful-shutdown wait for in-flight HTTP requests     | `30000`          |
+| `SHYNKRO_WS_DRAIN_MS`             | Graceful-shutdown wait for WS clients to disconnect    | `10000`          |
+| `SHYNKRO_MAX_BLOB_SIZE`           | Max bytes per binary blob                              | `53687091200`    |
+| `SHYNKRO_MAX_IMPORT_FILE_SIZE`    | Max bytes per file in an import session                | `104857600`      |
+| `SHYNKRO_MAX_IMPORT_SESSION_SIZE` | Cumulative size cap on a single import session         | `5368709120`     |
+| `SHYNKRO_WS_MAX_FRAME`            | Max WebSocket frame size (safety net against OOM)      | `52428800`       |
 
 ---
 

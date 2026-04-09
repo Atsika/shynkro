@@ -176,6 +176,16 @@ export interface DocSubscribedMessage {
   docId: DocId
 }
 
+/**
+ * Sent to every connected client at the start of a graceful server shutdown.
+ * Clients should treat this as advance notice to flush any pending state
+ * (drain the op queue, dump unsent ops to recovery, etc.) before the server
+ * force-closes the WebSocket at the end of the drain window.
+ */
+export interface ServerShutdownMessage {
+  type: "serverShutdown"
+}
+
 export interface DocResetMessage {
   type: "docReset"
   docId: DocId
@@ -216,4 +226,5 @@ export type ServerMessage =
   | WorkspaceRenamedMessage
   | DocSubscribedMessage
   | DocResetMessage
+  | ServerShutdownMessage
   | PongMessage
