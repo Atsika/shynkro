@@ -134,7 +134,10 @@
       }
     ],
     "menus": {
-      "commandPalette": [],
+      "commandPalette": [
+        { "command": "shynkro.trackFile", "when": "false" },
+        { "command": "shynkro.untrackFile", "when": "false" }
+      ],
       "explorer/context": [
         {
           "command": "shynkro.trackFile",

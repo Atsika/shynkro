@@ -183,15 +183,25 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
       .from(importFiles)
       .where(eq(importFiles.sessionId, params.importId))
 
-    // Store binary blobs BEFORE the DB transaction — if storage fails, abort early
+    // Store binary blobs BEFORE the DB transaction — if storage fails, abort
+    // early. Track which hashes this commit wrote so we can roll them back if
+    // the DB transaction fails. storage.put is content-addressed and idempotent,
+    // so a rollback only deletes blobs *this* commit introduced (skipped below
+    // if the hash was already present in storage).
+    const writtenHashes: string[] = []
     for (const file of staged) {
       if (file.kind === "binary" && file.content && file.hash && /^[0-9a-f]{64}$/.test(file.hash)) {
-        const data = Buffer.from(file.content, "base64")
-        await storage.put(file.hash, data)
+        const alreadyPresent = await storage.exists(file.hash)
+        if (!alreadyPresent) {
+          const data = Buffer.from(file.content, "base64")
+          await storage.put(file.hash, data)
+          writtenHashes.push(file.hash)
+        }
       }
     }
 
-    await db.transaction(async (tx) => {
+    try {
+      await db.transaction(async (tx) => {
       for (const file of staged) {
         const fileId = uuid()
         let docId: string | undefined
@@ -236,7 +246,16 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
         .update(importSessions)
         .set({ status: "committed" })
         .where(eq(importSessions.id, params.importId))
-    })
+      })
+    } catch (err) {
+      // Roll back blob writes this commit introduced so storage doesn't retain
+      // orphans referencing a failed commit. Best-effort — GC will sweep any
+      // stragglers.
+      for (const hash of writtenHashes) {
+        await storage.delete(hash).catch(() => {})
+      }
+      throw err
+    }
 
     return { ok: true }
   })

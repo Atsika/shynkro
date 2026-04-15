@@ -102,8 +102,8 @@ export const memberRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/members
 
       // S1: Update in-memory role BEFORE DB write to close the race window
       // where a demoted user's Yjs frames pass the ctx.role check. Revert on
-      // DB failure so the in-memory state doesn't drift.
-      const previousRole = target.role as "editor" | "viewer"
+      // DB failure by re-reading the current DB role so the revert isn't
+      // clobbered by a concurrent update that landed between read and write.
       updateClientRole(params.id, params.userId, body.role)
       try {
         await db
@@ -111,7 +111,14 @@ export const memberRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/members
           .set({ role: body.role })
           .where(and(eq(workspaceMembers.workspaceId, params.id), eq(workspaceMembers.userId, params.userId)))
       } catch (err) {
-        updateClientRole(params.id, params.userId, previousRole)
+        const [current] = await db
+          .select({ role: workspaceMembers.role })
+          .from(workspaceMembers)
+          .where(and(eq(workspaceMembers.workspaceId, params.id), eq(workspaceMembers.userId, params.userId)))
+          .limit(1)
+        if (current) {
+          updateClientRole(params.id, params.userId, current.role as "owner" | "editor" | "viewer")
+        }
         throw err
       }
 

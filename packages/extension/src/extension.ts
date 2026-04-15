@@ -73,8 +73,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // previous session) so the command palette shows the right button from the
   // start: "Login / Register" when logged out, "Logout" when logged in.
   const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
-  const existingToken = await tokenStore.getAccessToken(serverUrl)
-  vscode.commands.executeCommand("setContext", "shynkro.loggedIn", !!existingToken)
+  // Gate on the refresh token (long-lived) rather than the access token
+  // (15 min). A user whose access token expired while VS Code was closed still
+  // has valid credentials; auto-refresh will get them a fresh access token on
+  // the next request.
+  const hasCredentials = await authService.hasCredentials(serverUrl)
+  vscode.commands.executeCommand("setContext", "shynkro.loggedIn", hasCredentials)
 
   // Register commands
   context.subscriptions.push(
@@ -691,12 +695,15 @@ async function _startSyncInner(
   const syncDecoProvider = new SyncDecorationProvider(workspaceRoot, stateDb, conflictManager)
   syncDecoProviderInstance = syncDecoProvider
   syncDecoRegistration = vscode.window.registerFileDecorationProvider(syncDecoProvider)
+  // Do NOT push syncDecoRegistration / syncDecoProvider here — they are
+  // re-created on every _startSyncInner and the module-level vars are disposed
+  // explicitly (above + in stopSync). Pushing them into context.subscriptions
+  // would cause a stale disposable to be re-disposed at deactivate time, which
+  // can tear down the *current* provider and drop explorer badges mid-session.
   context.subscriptions.push(
     conflictDecorations,
     vscode.languages.registerCodeLensProvider({ scheme: "file" }, conflictLensProvider),
     vscode.window.registerTreeDataProvider("shynkro.conflictView", conflictView),
-    syncDecoRegistration,
-    syncDecoProvider,
     // M8: Refresh file badges when conflicts change — use targeted URIs from
     // the conflict list to avoid full-tree invalidation.
     conflictManager.onListChanged(() => {
@@ -970,6 +977,10 @@ async function _startSyncInner(
 }
 
 function stopSync(): void {
+  // M5: reset the start guard so a logout-then-login (or any stop→start race)
+  // doesn't leave `startSyncRunning` pinned at true, silently dropping the
+  // next connect attempt.
+  startSyncRunning = false
   syncDecoRegistration?.dispose()
   syncDecoRegistration = null
   syncDecoProviderInstance?.dispose()

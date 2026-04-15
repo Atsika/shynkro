@@ -207,14 +207,6 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
 
     // ---- subscribeWorkspace ----
     if (msg.type === "subscribeWorkspace") {
-      // Subscribe optimistically before the DB query so that a subscribeDoc
-      // message that arrives while we await the membership check doesn't get
-      // rejected with "Not subscribed to workspace". The subscribeDoc handler
-      // still verifies doc ownership, so the security exposure is minimal.
-      // If the membership check fails we roll back immediately.
-      subscribeToWorkspace(ctx, msg.workspaceId)
-      ctx.role = "viewer" // safe default until DB confirms role
-
       const [member] = await db
         .select()
         .from(workspaceMembers)
@@ -227,12 +219,12 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         .limit(1)
 
       if (!member) {
-        ctx.subscribedWorkspaces.delete(msg.workspaceId) // roll back optimistic subscribe
         ws.send(JSON.stringify({ type: "error", code: "FORBIDDEN", message: "Not a workspace member" }))
         return
       }
 
       ctx.role = member.role as "owner" | "editor" | "viewer"
+      subscribeToWorkspace(ctx, msg.workspaceId)
 
       // Immediate broadcast — gives instant feedback to the subscribing client
       const presence = getWorkspacePresence(msg.workspaceId)
@@ -404,6 +396,10 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function scheduleExpiryTimers(ctx: WsContext, ws: any, exp: number): void {
   const msUntilExpiry = exp * 1000 - Date.now()
+  if (msUntilExpiry <= 0) {
+    ws.close(4001, "Auth expired")
+    return
+  }
   const warnAt = msUntilExpiry - TOKEN_EXPIRY_WARNING_SECS * 1000
   if (warnAt > 0) {
     ctx.expiryWarningTimer = setTimeout(() => {
@@ -412,11 +408,13 @@ function scheduleExpiryTimers(ctx: WsContext, ws: any, exp: number): void {
         ws.send(JSON.stringify({ type: "tokenExpiring", expiresIn: TOKEN_EXPIRY_WARNING_SECS }))
       }
     }, warnAt)
-    ctx.expiryCloseTimer = setTimeout(() => {
-      ctx.expiryCloseTimer = null
-      if (ctxMap.has(ws.raw)) {
-        ws.close(4001, "Auth expired")
-      }
-    }, msUntilExpiry)
+  } else if (ctxMap.has(ws.raw)) {
+    ws.send(JSON.stringify({ type: "tokenExpiring", expiresIn: Math.max(1, Math.floor(msUntilExpiry / 1000)) }))
   }
+  ctx.expiryCloseTimer = setTimeout(() => {
+    ctx.expiryCloseTimer = null
+    if (ctxMap.has(ws.raw)) {
+      ws.close(4001, "Auth expired")
+    }
+  }, msUntilExpiry)
 }

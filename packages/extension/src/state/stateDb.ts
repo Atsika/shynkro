@@ -100,12 +100,20 @@ export class StateDb {
     this.db.exec(`PRAGMA user_version = ${version};`)
   }
 
-  // M4: Restrict table/column to known literals to prevent accidental SQL injection
+  // M4/H9: SQL injection guard. Table is a literal union. Column and type are
+  // validated against a conservative whitelist pattern before interpolation —
+  // ALTER TABLE does not accept bound parameters, so we must interpolate.
   private addColumnIfMissing(
     table: "file_map" | "pending_ops" | "pending_yjs_frames",
     column: string,
     type: string
   ): void {
+    if (!/^[a-z_][a-z0-9_]*$/i.test(column)) {
+      throw new Error(`addColumnIfMissing: invalid column name ${JSON.stringify(column)}`)
+    }
+    if (!/^[A-Z][A-Z0-9_ ()',]*$/i.test(type)) {
+      throw new Error(`addColumnIfMissing: invalid type ${JSON.stringify(type)}`)
+    }
     const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
     if (!cols.some((c) => c.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`)

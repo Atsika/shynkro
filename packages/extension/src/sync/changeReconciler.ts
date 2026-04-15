@@ -26,6 +26,12 @@ export class ChangeReconciler {
   /** E4: Guard against concurrent reconcile runs */
   private reconciling = false
   /**
+   * M11: While true, apply* methods skip per-change setRevision so the page's
+   * end-of-loop write in `_reconcile` is the sole advance. WS single-event
+   * path leaves this false and persists each event's revision immediately.
+   */
+  private inReconcileLoop = false
+  /**
    * Paths that were "untracked" by the local user — the server will broadcast
    * fileDeleted for these, but we must NOT rm the local file. The set is
    * consumed (entry removed) when applyDeleted fires for that path.
@@ -80,37 +86,48 @@ export class ChangeReconciler {
       }
     }
 
-    while (true) {
-      const page = await fetchPage(since, offset)
-      finalRevision = page.currentRevision
+    this.inReconcileLoop = true
+    try {
+      while (true) {
+        const page = await fetchPage(since, offset)
+        finalRevision = page.currentRevision
 
-      for (const change of page.changes) {
-        switch (change.type) {
-          case "fileCreated":
-            await this.applyCreated(change as unknown as FileCreatedMessage)
-            break
-          case "fileRenamed":
-            await this.applyRenamed(change as unknown as FileRenamedMessage)
-            break
-          case "fileDeleted":
-            await this.applyDeleted(change as unknown as FileDeletedMessage)
-            break
-          case "binaryUpdated":
-            await this.applyBinaryUpdated(change as unknown as BinaryUpdatedMessage)
-            break
+        for (const change of page.changes) {
+          switch (change.type) {
+            case "fileCreated":
+              await this.applyCreated(change as unknown as FileCreatedMessage)
+              break
+            case "fileRenamed":
+              await this.applyRenamed(change as unknown as FileRenamedMessage)
+              break
+            case "fileDeleted":
+              await this.applyDeleted(change as unknown as FileDeletedMessage)
+              break
+            case "binaryUpdated":
+              await this.applyBinaryUpdated(change as unknown as BinaryUpdatedMessage)
+              break
+          }
         }
-      }
 
-      if (!page.hasMore || page.nextOffset === null || page.nextOffset === undefined) break
-      offset = page.nextOffset
-      // since stays the same across pages — pagination is anchored to the
-      // original query. If the server gets new changes mid-drain, they'll
-      // arrive on the next reconcile tick via startPolling.
+        if (!page.hasMore || page.nextOffset === null || page.nextOffset === undefined) break
+        offset = page.nextOffset
+        // since stays the same across pages — pagination is anchored to the
+        // original query. If the server gets new changes mid-drain, they'll
+        // arrive on the next reconcile tick via startPolling.
+      }
+    } finally {
+      this.inReconcileLoop = false
     }
 
     if (finalRevision !== null) {
       this.stateDb.setRevision(this.workspaceId, finalRevision)
     }
+  }
+
+  /** M11: setRevision that no-ops while we're draining a reconcile page. */
+  private setRevisionIfLive(msg: { revision: number }): void {
+    if (this.inReconcileLoop) return
+    this.stateDb.setRevision(this.workspaceId, msg.revision)
   }
 
   wireWsEvents(onServerMessage: vscode.Event<import("@shynkro/shared").ServerMessage>): void {
@@ -149,14 +166,14 @@ export class ChangeReconciler {
       this.restClient.deleteFile(this.workspaceId, msg.fileId as FileId).catch((err) => {
         log.appendLine(`[reconciler] re-delete error for ${msg.path}: ${err}`)
       })
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
       return
     }
 
     // Skip files that already exist on disk — Yjs handles content sync for text files
     if (fs.existsSync(localPath)) {
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind, msg.docId ?? undefined)
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
       if (msg.kind === "text" && msg.docId) this._onTextFileRegistered.fire(localPath)
       this._onFileTracked.fire(localPath)
       return
@@ -195,7 +212,7 @@ export class ChangeReconciler {
             log.appendLine(`[reconciler] chmod ${row.mode.toString(8)} failed for ${localPath}: ${err}`)
           }
         }
-        this.stateDb.setRevision(this.workspaceId, msg.revision)
+        this.setRevisionIfLive(msg)
         log.appendLine(`[reconciler] created ${msg.path}`)
         this._onTextFileRegistered.fire(localPath)
         this._onFileTracked.fire(localPath)
@@ -211,7 +228,7 @@ export class ChangeReconciler {
       if (msg.mode !== null && msg.mode !== undefined) {
         this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
       }
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
       this._onFileTracked.fire(localPath)
       try {
         await this.binarySync.download(msg.fileId, localPath, this.workspaceId)
@@ -222,7 +239,7 @@ export class ChangeReconciler {
       // folder
       fs.mkdirSync(localPath, { recursive: true })
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind)
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
       this._onFileTracked.fire(localPath)
     }
   }
@@ -245,7 +262,7 @@ export class ChangeReconciler {
       }
       // stateDb.renameFile is idempotent — safe to call whether or not we just moved.
       this.stateDb.renameFile(msg.fileId, msg.path)
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
       this._onFileTracked.fire(newLocal)
       this._onFileTracked.fire(oldLocal)
     } catch (err) {
@@ -283,7 +300,7 @@ export class ChangeReconciler {
 
     // Hard-delete: server has confirmed the deletion, so the tombstone is no longer needed.
     this.stateDb.purgeFile(msg.fileId)
-    this.stateDb.setRevision(this.workspaceId, msg.revision)
+    this.setRevisionIfLive(msg)
   }
 
   /** Fires when a file was deleted by another collaborator (via WS or poll). */
@@ -316,7 +333,7 @@ export class ChangeReconciler {
         // (e.g. both sides regenerated the same PDF from synced source files)
         if (localHash === msg.hash) {
           this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
-          this.stateDb.setRevision(this.workspaceId, msg.revision)
+          this.setRevisionIfLive(msg)
           return
         }
 
@@ -339,7 +356,7 @@ export class ChangeReconciler {
         this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
       }
 
-      this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this.setRevisionIfLive(msg)
     } catch (err) {
       log.appendLine(`[reconciler] applyBinaryUpdated error for ${row.path}: ${err}`)
     }

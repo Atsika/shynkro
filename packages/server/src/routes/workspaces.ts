@@ -10,8 +10,12 @@ import { recordChange } from "../lib/changeLog.js"
 import { getPlainText, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { zipSync } from "fflate"
+import { envInt } from "../lib/envInt.js"
 
 const storage = createStorageBackend()
+
+/** Max uncompressed bytes an export may accumulate. Default 1 GB. */
+const MAX_EXPORT_BYTES = envInt("SHYNKRO_MAX_EXPORT_BYTES", 1024 * 1024 * 1024)
 
 export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
   .use(withAuth)
@@ -95,18 +99,21 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       if (!member) return status(403, { message: "Forbidden" })
       if (member.role !== "owner") return status(403, { message: "Only the owner can rename a workspace" })
 
-      // S6: Wrap revision bump + rename + changelog in a single transaction
+      // S6: Wrap rename + revision bump + changelog in a single transaction so
+      // a concurrent /changes poller can never observe a revision bump without
+      // the corresponding workspaceRenamed entry.
       const revision = await db.transaction(async (tx) => {
-        const [{ revision: rev }] = await tx.execute<{ revision: number }>(
-          sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
-        )
         await tx
           .update(workspaces)
           .set({ name: body.name })
           .where(eq(workspaces.id, params.id))
+        const [{ revision: rev }] = await tx.execute<{ revision: number }>(
+          sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
+        )
+        await recordChange({ workspaceId: params.id, revision: rev, type: "workspaceRenamed" }, tx)
         return rev
       })
-      await recordChange({ workspaceId: params.id, revision, type: "workspaceRenamed" })
+      void revision
       broadcastToWorkspace(params.id, { type: "workspaceRenamed", workspaceId: params.id, name: body.name })
 
       return { ok: true }
@@ -403,6 +410,7 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
         )
 
       const zipEntries: Record<string, [Uint8Array, { level: 0 }]> = {}
+      let accumulated = 0
 
       try {
         for (const file of files) {
@@ -410,8 +418,23 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
             zipEntries[file.path + "/"] = [new Uint8Array(0), { level: 0 }]
           } else if (file.kind === "text" && file.docId) {
             const text = await getPlainText(file.docId)
-            zipEntries[file.path] = [new TextEncoder().encode(text), { level: 0 }]
+            const bytes = new TextEncoder().encode(text)
+            accumulated += bytes.length
+            if (accumulated > MAX_EXPORT_BYTES) {
+              return status(413, {
+                code: "EXPORT_TOO_LARGE",
+                message: `Export exceeds SHYNKRO_MAX_EXPORT_BYTES=${MAX_EXPORT_BYTES}. Split the workspace or raise the cap.`,
+              })
+            }
+            zipEntries[file.path] = [bytes, { level: 0 }]
           } else if (file.kind === "binary" && file.binaryHash) {
+            accumulated += file.binarySize ?? 0
+            if (accumulated > MAX_EXPORT_BYTES) {
+              return status(413, {
+                code: "EXPORT_TOO_LARGE",
+                message: `Export exceeds SHYNKRO_MAX_EXPORT_BYTES=${MAX_EXPORT_BYTES}. Split the workspace or raise the cap.`,
+              })
+            }
             const data = await storage.get(file.binaryHash)
             zipEntries[file.path] = [data, { level: 0 }]
           }

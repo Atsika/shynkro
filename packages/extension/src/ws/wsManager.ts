@@ -184,6 +184,13 @@ export class WsManager {
           }
         }
       }
+      // H6: the socket can die mid-flush. If readyState is no longer OPEN,
+      // skip the "connected" transition — the close handler will schedule a
+      // reconnect and we'll try again.
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        log.appendLine("[ws] socket not OPEN after flush, deferring connected status")
+        return
+      }
       this._onStatusChange.fire("connected")
       this.statusBar.setStatus("connected")
       this.startPing()
