@@ -23,11 +23,8 @@ import { acquireLock } from "./lock/lockFile"
 import { drainPendingOps, serializePendingOpsToRecovery } from "./sync/opQueue"
 import { PresenceView, PresenceItem } from "./views/presenceView"
 import { ActionsView } from "./views/actionsView"
-import { ConflictView } from "./views/conflictView"
-import { ConflictManager } from "./conflict/conflictManager"
-import { ConflictDecorations } from "./conflict/conflictDecorations"
-import { ConflictLensProvider } from "./conflict/conflictLens"
 import { SyncDecorationProvider } from "./views/syncDecorationProvider"
+import { BinaryConflictPicker } from "./binary/binaryConflictPicker"
 import { SHYNKRO_DIR, PROJECT_JSON, EXTENSION_VERSION } from "./constants"
 import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { decodeTextFile } from "./text/textNormalize"
@@ -37,16 +34,15 @@ let wsManager: WsManager | null = null
 let fileWatcher: FileWatcher | null = null
 let changeReconciler: ChangeReconciler | null = null
 let yjsBridge: YjsBridge | null = null
-let conflictManager: ConflictManager | null = null
 let statusBar: StatusBar | null = null
 let authService: AuthService | null = null
 let lockDir: string | null = null
 let shynkroDirWatcher: vscode.FileSystemWatcher | null = null
 let presenceView: PresenceView | null = null
-let conflictView: ConflictView | null = null
 let binarySyncInstance: BinarySync | null = null
 let syncDecoProviderInstance: SyncDecorationProvider | null = null
 let syncDecoRegistration: vscode.Disposable | null = null
+let binaryConflictPicker: BinaryConflictPicker | null = null
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   try {
@@ -66,7 +62,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.registerTreeDataProvider("shynkro.presenceView", presenceView),
     vscode.window.registerTreeDataProvider("shynkro.actionsView", actionsView)
   )
-  // ConflictView is registered after conflictManager is created in startSync
   vscode.commands.executeCommand("setContext", "shynkro.syncActive", false)
 
   // Detect whether the user is already logged in (has a valid token from a
@@ -468,22 +463,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("shynkro.acceptLocalHunk", (docId?: string, hunkIndex?: number) => {
-      if (docId != null && hunkIndex != null) {
-        conflictManager?.resolveHunk(docId, hunkIndex, "local")
-      } else {
-        conflictManager?.resolveHunkAtCursor(docId, "local")
-      }
-    }),
-
-    vscode.commands.registerCommand("shynkro.acceptServerHunk", (docId?: string, hunkIndex?: number) => {
-      if (docId != null && hunkIndex != null) {
-        conflictManager?.resolveHunk(docId, hunkIndex, "server")
-      } else {
-        conflictManager?.resolveHunkAtCursor(docId, "server")
-      }
-    }),
-
     vscode.commands.registerCommand("shynkro.relink", async () => {
       const found = findProjectConfig()
       if (!found) { vscode.window.showErrorMessage("Shynkro: no project.json found in this workspace"); return }
@@ -662,6 +641,7 @@ async function _startSyncInner(
   const chunkedDownloader = new ChunkedDownloader({
     baseUrl: serverUrl,
     getToken: () => authService!.getValidAccessToken(serverUrl).catch(() => undefined),
+    addWriteTag: (absPath: string) => fileWatcher!.addWriteTag(absPath),
   })
   binarySyncInstance = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher, {
     uploader: chunkedUploader,
@@ -673,45 +653,29 @@ async function _startSyncInner(
     binarySync!
   )
 
-  const conflictDecorations = new ConflictDecorations()
-  const conflictLensProvider = new ConflictLensProvider()
-  conflictManager = new ConflictManager(
+  yjsBridge = new YjsBridge(wsManager, fileWatcher, stateDb, workspaceRoot, restClient)
+
+  // File decorations: "S" badge on synced files, "!" on binary conflicts.
+  syncDecoRegistration?.dispose()
+  syncDecoProviderInstance?.dispose()
+  const syncDecoProvider = new SyncDecorationProvider(workspaceRoot, stateDb)
+  syncDecoProviderInstance = syncDecoProvider
+  syncDecoRegistration = vscode.window.registerFileDecorationProvider(syncDecoProvider)
+
+  // Binary conflict picker — only resolver(s) see UI; everyone else gets the
+  // winner via silent reconcile. Picker is "live": reacts to onBinaryReconciled
+  // events for the same file and re-evaluates against the new server hash.
+  binaryConflictPicker?.dispose()
+  binaryConflictPicker = new BinaryConflictPicker(
+    changeReconciler,
+    binarySync,
+    restClient,
+    stateDb,
+    syncDecoProvider,
     (n) => {
       statusBar?.setConflicts(n)
       vscode.commands.executeCommand("setContext", "shynkro.hasActiveConflict", n > 0)
     },
-    conflictDecorations,
-    conflictLensProvider
-  )
-  yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager, stateDb, workspaceRoot, restClient)
-
-  // Register conflict view now that conflictManager is available
-  conflictView?.dispose()
-  conflictView = new ConflictView(conflictManager)
-  // File decorations: "S" badge on synced files, "!" on conflicts.
-  // Dispose any prior registration so a reconnect doesn't stack duplicate badges.
-  syncDecoRegistration?.dispose()
-  syncDecoProviderInstance?.dispose()
-  const syncDecoProvider = new SyncDecorationProvider(workspaceRoot, stateDb, conflictManager)
-  syncDecoProviderInstance = syncDecoProvider
-  syncDecoRegistration = vscode.window.registerFileDecorationProvider(syncDecoProvider)
-  // Do NOT push syncDecoRegistration / syncDecoProvider here — they are
-  // re-created on every _startSyncInner and the module-level vars are disposed
-  // explicitly (above + in stopSync). Pushing them into context.subscriptions
-  // would cause a stale disposable to be re-disposed at deactivate time, which
-  // can tear down the *current* provider and drop explorer badges mid-session.
-  context.subscriptions.push(
-    conflictDecorations,
-    vscode.languages.registerCodeLensProvider({ scheme: "file" }, conflictLensProvider),
-    vscode.window.registerTreeDataProvider("shynkro.conflictView", conflictView),
-    // M8: Refresh file badges when conflicts change — use targeted URIs from
-    // the conflict list to avoid full-tree invalidation.
-    conflictManager.onListChanged(() => {
-      const cm = conflictManager
-      if (!cm) return
-      const uris = cm.getConflicts().map((c) => vscode.Uri.file(c.filePath))
-      syncDecoProvider.refresh(uris.length > 0 ? uris : undefined)
-    })
   )
 
   // Wire WS events
@@ -981,14 +945,12 @@ function stopSync(): void {
   // doesn't leave `startSyncRunning` pinned at true, silently dropping the
   // next connect attempt.
   startSyncRunning = false
+  binaryConflictPicker?.dispose()
+  binaryConflictPicker = null
   syncDecoRegistration?.dispose()
   syncDecoRegistration = null
   syncDecoProviderInstance?.dispose()
   syncDecoProviderInstance = null
-  conflictView?.dispose()
-  conflictView = null
-  conflictManager?.dispose()
-  conflictManager = null
   yjsBridge?.dispose()
   yjsBridge = null
   changeReconciler?.dispose()

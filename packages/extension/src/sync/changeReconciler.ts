@@ -307,55 +307,86 @@ export class ChangeReconciler {
   private readonly _onRemoteFileDeleted = new vscode.EventEmitter<{ absPath: string }>()
   readonly onRemoteFileDeleted = this._onRemoteFileDeleted.event
 
+  /**
+   * Fires after a `binaryUpdated` event has been processed (silently
+   * downloaded, conflict requested, or no-op). Carries the new server hash so
+   * the binary conflict picker can refresh its UI live when the server-side
+   * state moves under an open dialog.
+   */
+  private readonly _onBinaryReconciled = new vscode.EventEmitter<{ fileId: string; serverHash: string; revision: number }>()
+  readonly onBinaryReconciled = this._onBinaryReconciled.event
+
+  /**
+   * Fires when applyBinaryUpdated detects a divergence the picker should
+   * handle. The picker is wired up at startup and decides whether to show UI.
+   */
+  private readonly _onBinaryConflict = new vscode.EventEmitter<{
+    fileId: string
+    workspaceId: WorkspaceId
+    localPath: string
+    localHash: string
+    serverHash: string
+    revision: number
+  }>()
+  readonly onBinaryConflict = this._onBinaryConflict.event
+
   private async applyBinaryUpdated(msg: BinaryUpdatedMessage): Promise<void> {
     const row = this.stateDb.getFileById(msg.fileId)
     if (!row) return
-    // Refresh stored mode bits regardless of whether content changed — covers the
-    // case where a peer ran `chmod +x` and re-uploaded the same content.
+    // Refresh stored mode bits regardless of whether content changed.
     if (msg.mode !== null && msg.mode !== undefined) {
       this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
     }
-    if (row.binaryHash === msg.hash) return // already have it
+    if (row.binaryHash === msg.hash) {
+      // Already matched — make sure the synced marker is up to date too, then
+      // notify so an open picker can auto-dismiss.
+      if (row.syncedBinaryHash !== msg.hash) {
+        this.stateDb.setSyncedBinaryHash(msg.fileId, msg.hash)
+      }
+      this._onBinaryReconciled.fire({ fileId: msg.fileId, serverHash: msg.hash, revision: msg.revision })
+      return
+    }
 
     const localPath = safeJoin(this.workspaceRoot, row.path)
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${row.path}`); return }
     try {
-      // If local file was also modified since last sync, ask the user which version to keep.
+      const syncedHash = row.syncedBinaryHash ?? row.binaryHash
       let localHash: string | undefined
-      let localChanged = false
-      if (row.binaryHash && fs.existsSync(localPath)) {
+      if (fs.existsSync(localPath)) {
         localHash = await this.binarySync.computeHash(localPath)
-        localChanged = localHash !== row.binaryHash
+      }
+      const localChanged = !!syncedHash && !!localHash && localHash !== syncedHash
+
+      // Coincidentally identical: local edit happens to match server's new hash.
+      if (localHash === msg.hash) {
+        this.stateDb.setSyncedBinaryHash(msg.fileId, msg.hash)
+        this._onBinaryReconciled.fire({ fileId: msg.fileId, serverHash: msg.hash, revision: msg.revision })
+        this.setRevisionIfLive(msg)
+        return
       }
 
-      if (localChanged) {
-        // If local file already matches the server hash, no real conflict
-        // (e.g. both sides regenerated the same PDF from synced source files)
-        if (localHash === msg.hash) {
-          this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
-          this.setRevisionIfLive(msg)
-          return
-        }
-
-        const fileName = path.basename(row.path)
-        const choice = await vscode.window.showWarningMessage(
-          `Shynkro: "${fileName}" was modified both locally and on the server.`,
-          "Keep Local",
-          "Keep Server"
-        )
-        if (choice === "Keep Local") {
-          await this.binarySync.upload(msg.fileId as FileId, localPath, this.workspaceId)
-          // E8: Persist local hash so the next poll doesn't re-download server version
-          if (localHash) this.stateDb.updateBinaryHash(msg.fileId, localHash)
-        } else {
-          await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
-          this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
-        }
-      } else {
-        await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
-        this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
+      if (localChanged && localHash) {
+        // True conflict — defer to the picker (wired externally at startup).
+        // Don't download/upload here; the picker will choose and call binarySync.
+        this._onBinaryConflict.fire({
+          fileId: msg.fileId,
+          workspaceId: this.workspaceId,
+          localPath,
+          localHash,
+          serverHash: msg.hash,
+          revision: msg.revision,
+        })
+        // Fire reconciled so any *other* open picker for this file refreshes,
+        // but don't mark synced — the user still owes a decision.
+        this._onBinaryReconciled.fire({ fileId: msg.fileId, serverHash: msg.hash, revision: msg.revision })
+        this.setRevisionIfLive(msg)
+        return
       }
 
+      // No local change → silent download.
+      await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+      // binarySync.download already sets syncedBinaryHash.
+      this._onBinaryReconciled.fire({ fileId: msg.fileId, serverHash: msg.hash, revision: msg.revision })
       this.setRevisionIfLive(msg)
     } catch (err) {
       log.appendLine(`[reconciler] applyBinaryUpdated error for ${row.path}: ${err}`)
@@ -375,5 +406,7 @@ export class ChangeReconciler {
     this._onTextFileRegistered.dispose()
     this._onFileTracked.dispose()
     this._onRemoteFileDeleted.dispose()
+    this._onBinaryReconciled.dispose()
+    this._onBinaryConflict.dispose()
   }
 }

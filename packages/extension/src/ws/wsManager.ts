@@ -1,7 +1,21 @@
 import * as vscode from "vscode"
 // Node 22+ has global WebSocket (stable)
-import { PROTOCOL_VERSION } from "@shynkro/shared"
+import { PROTOCOL_VERSION, WS_BINARY_YJS_UPDATE } from "@shynkro/shared"
 import type { ClientMessage, ServerMessage, WorkspaceId } from "@shynkro/shared"
+
+function uuidToBytes(uuid: string): Uint8Array {
+  const hex = uuid.replace(/-/g, "")
+  const bytes = new Uint8Array(16)
+  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return bytes
+}
+function buildBinaryFrame(frameType: number, docId: string, data: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(1 + 16 + data.length)
+  frame[0] = frameType
+  frame.set(uuidToBytes(docId), 1)
+  frame.set(data, 17)
+  return frame
+}
 import {
   EXTENSION_VERSION,
   RECONNECT_BASE_MS,
@@ -169,16 +183,20 @@ export class WsManager {
       //   subscribeWorkspace → offline frames → subscribeDoc
       // so the server applies the offline edits before computing the state to send.
       if (this.stateDb) {
-        const rows = this.stateDb.allPendingYjsFrames()
+        // V6: flush all unacked local Yjs updates. Each row carries doc_id +
+        // raw update bytes; rebuild the wire frame here so storage stays
+        // origin-format-agnostic. Mark acked on successful send.
+        const rows = this.stateDb.loadAllUnackedLocalUpdates()
         if (rows.length > 0) {
-          log.appendLine(`[ws] flushing ${rows.length} persisted Yjs frame(s) after reconnect`)
+          log.appendLine(`[ws] flushing ${rows.length} persisted Yjs update(s) after reconnect`)
           for (const row of rows) {
             if (this.ws?.readyState !== WebSocket.OPEN) break
             try {
-              this.ws.send(row.data)
-              this.stateDb.removePendingYjsFrame(row.id)
+              const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, row.docId, row.bytes)
+              this.ws.send(frame)
+              this.stateDb.markYjsUpdateAcked(row.id)
             } catch (err) {
-              log.appendLine(`[ws] flush send error for frame ${row.id}: ${err}`)
+              log.appendLine(`[ws] flush send error for update ${row.id}: ${err}`)
               break
             }
           }
@@ -237,29 +255,18 @@ export class WsManager {
     }
   }
 
-  sendBinary(frame: Uint8Array): void {
+  /**
+   * Send a binary WS frame. Returns true if the WS accepted it for delivery,
+   * false if the socket was not open (caller's responsibility to persist via
+   * `stateDb.appendYjsUpdate(..., acked: false)` and let the reconnect flush
+   * replay it).
+   */
+  sendBinary(frame: Uint8Array): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(frame)
-      return
+      return true
     }
-    // Offline path: persist the frame so it survives extension reloads, not
-    // just the current process lifetime. Falls back to no-op if stateDb is
-    // unavailable (should not happen in normal operation, but we defensively
-    // drop rather than crash — matches pre-B2 behavior in that edge case).
-    if (!this.stateDb) {
-      log.appendLine("[ws] sendBinary offline with no stateDb — frame dropped")
-      return
-    }
-    // The wire format is [frameType(1), docId(16), payload] — extract docId so
-    // we can persist it alongside the blob for diagnostics + future state-vector
-    // handshake work.
-    if (frame.length < 17) {
-      log.appendLine(`[ws] sendBinary dropped malformed frame len=${frame.length}`)
-      return
-    }
-    const h = Buffer.from(frame.slice(1, 17)).toString("hex")
-    const docId = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`
-    this.stateDb.enqueueYjsFrame(docId, frame)
+    return false
   }
 
   private startPing(): void {

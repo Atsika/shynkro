@@ -1,57 +1,59 @@
 import * as vscode from "vscode"
 import * as path from "path"
 import type { StateDb } from "../state/stateDb"
-import type { ConflictManager } from "../conflict/conflictManager"
 
 /**
- * Adds small badges to files in the VS Code explorer so the user can see
- * at a glance which files are being synced by Shynkro and which aren't.
+ * Adds small badges to files in the VS Code explorer:
  *
  * - "S" badge (cloud color) = file is tracked and synced with the workspace
- * - "!" badge (warning color) = file has an active sync conflict
- * - No badge = file is not tracked (ignored, outside workspace, case collision orphan, etc.)
+ * - "!" badge (warning color) = file has a pending binary conflict awaiting
+ *   user action (text files no longer conflict — Yjs CRDT auto-merges)
+ * - No badge = file is not tracked
  *
- * Coexists with Git's own FileDecorationProvider — VS Code renders multiple
- * badges side by side.
+ * Coexists with Git's own FileDecorationProvider.
  */
 export class SyncDecorationProvider implements vscode.FileDecorationProvider {
   private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>()
   readonly onDidChangeFileDecorations = this._onDidChange.event
+  private readonly conflictPaths = new Set<string>()
 
   constructor(
     private readonly workspaceRoot: string,
     private readonly stateDb: StateDb,
-    private readonly conflictManager: ConflictManager
   ) {}
+
+  /**
+   * Mark/unmark a file as having a pending binary conflict. Called by the
+   * binary conflict picker when its dialog opens or closes.
+   */
+  setConflict(absPath: string, conflicted: boolean): void {
+    if (conflicted) this.conflictPaths.add(absPath)
+    else this.conflictPaths.delete(absPath)
+    this._onDidChange.fire([vscode.Uri.file(absPath)])
+  }
+
+  /** Number of files currently marked as conflicting (for status bar). */
+  get conflictCount(): number {
+    return this.conflictPaths.size
+  }
 
   provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
     if (uri.scheme !== "file") return undefined
-
-    // Only decorate files inside the workspace root
     const fsPath = uri.fsPath
     if (!fsPath.startsWith(this.workspaceRoot)) return undefined
 
     const relPath = path.relative(this.workspaceRoot, fsPath).replace(/\\/g, "/")
     if (!relPath || relPath.startsWith("..")) return undefined
-
-    // Skip the .shynkro directory itself
     if (relPath.startsWith(".shynkro")) return undefined
 
-    // Check for active conflict first (takes priority over "synced")
-    const allConflicts = this.conflictManager.getConflicts()
-    const hasConflict = allConflicts.some((c: { filePath: string }) => {
-      const conflictRel = path.relative(this.workspaceRoot, c.filePath).replace(/\\/g, "/")
-      return conflictRel === relPath
-    })
-    if (hasConflict) {
+    if (this.conflictPaths.has(fsPath)) {
       return {
         badge: "!",
-        tooltip: "Shynkro: sync conflict — resolve before continuing",
+        tooltip: "Shynkro: binary sync conflict — resolve before continuing",
         color: new vscode.ThemeColor("list.warningForeground"),
       }
     }
 
-    // Check if the file is tracked
     const row = this.stateDb.getFileByPath(relPath)
     if (row) {
       return {
@@ -60,12 +62,9 @@ export class SyncDecorationProvider implements vscode.FileDecorationProvider {
         color: new vscode.ThemeColor("charts.green"),
       }
     }
-
-    // Not tracked — no decoration. The absence of "S" is the indicator.
     return undefined
   }
 
-  /** Call when files are added/removed/renamed to refresh decorations. */
   refresh(uris?: vscode.Uri[]): void {
     this._onDidChange.fire(uris ?? undefined)
   }

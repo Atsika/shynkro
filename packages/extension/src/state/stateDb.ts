@@ -1,8 +1,8 @@
 import { DatabaseSync } from "node:sqlite"
 import type { FileMapRow } from "../types"
 
-const SCHEMA_VERSION = 5
-const FILE_MAP_COLS = "file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode"
+const SCHEMA_VERSION = 6
+const FILE_MAP_COLS = "file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, synced_binary_hash as syncedBinaryHash, eol_style as eolStyle, has_bom as hasBom, mode"
 
 export class StateDb {
   private db: DatabaseSync
@@ -49,6 +49,24 @@ export class StateDb {
         data       BLOB NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+      -- V6: Local-first Yjs persistence. Snapshots are full encoded doc states
+      -- (Y.encodeStateAsUpdate); updates are incremental deltas appended since
+      -- the last snapshot. Compaction collapses N updates into a fresh snapshot.
+      CREATE TABLE IF NOT EXISTS yjs_local_state (
+        doc_id       TEXT PRIMARY KEY,
+        snapshot     BLOB NOT NULL,
+        update_count INTEGER NOT NULL DEFAULT 0,
+        updated_at   INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS yjs_local_updates (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id     TEXT NOT NULL,
+        bytes      BLOB NOT NULL,
+        origin     TEXT NOT NULL,
+        acked      INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS yjs_local_updates_doc_idx ON yjs_local_updates(doc_id, id);
     `)
 
     // Apply incremental migrations for upgrades from older schemas.
@@ -86,6 +104,26 @@ export class StateDb {
       // a file; the tombstone survives until the server confirms the delete or
       // the prune job sweeps anything older than the recovery window.
       this.addColumnIfMissing("file_map", "deleted_at", "TEXT")
+    }
+    if (currentVersion < 6) {
+      // V6: file_map gains synced_binary_hash so the binary conflict picker can
+      // tell "both sides changed" (local != server AND local != last-synced)
+      // from "only server changed" (local == last-synced). Migrate existing
+      // rows by seeding synced_binary_hash from binary_hash — assume past sync
+      // state matches current local state for the purpose of bootstrapping.
+      this.addColumnIfMissing("file_map", "synced_binary_hash", "TEXT")
+      this.db.exec(`
+        UPDATE file_map SET synced_binary_hash = binary_hash
+        WHERE synced_binary_hash IS NULL AND binary_hash IS NOT NULL;
+      `)
+      // Migrate any in-flight pending_yjs_frames into yjs_local_updates so the
+      // new bridge can replay them on next open.
+      this.db.exec(`
+        INSERT INTO yjs_local_updates (doc_id, bytes, origin, acked, created_at)
+        SELECT doc_id, data, 'local', 0, strftime('%s','now') * 1000
+        FROM pending_yjs_frames
+      `)
+      this.db.exec(`DELETE FROM pending_yjs_frames;`)
     }
     this.setSchemaVersion(SCHEMA_VERSION)
   }
@@ -194,6 +232,16 @@ export class StateDb {
 
   updateBinaryHash(fileId: string, hash: string): void {
     this.db.prepare("UPDATE file_map SET binary_hash = ? WHERE file_id = ?").run(hash, fileId)
+  }
+
+  /**
+   * Update both local and last-synced binary hash atomically. Use after a
+   * successful upload or download — both ends agree on this hash.
+   */
+  setSyncedBinaryHash(fileId: string, hash: string): void {
+    this.db
+      .prepare("UPDATE file_map SET binary_hash = ?, synced_binary_hash = ? WHERE file_id = ?")
+      .run(hash, hash, fileId)
   }
 
   /**
@@ -312,6 +360,111 @@ export class StateDb {
   pendingYjsFrameCount(): number {
     const row = this.db.prepare("SELECT COUNT(*) as c FROM pending_yjs_frames").get() as { c: number }
     return row.c
+  }
+
+  // ---- Local Yjs persistence (V6) ----
+
+  /**
+   * Load the snapshot for a doc, or undefined if none exists. Always check
+   * `loadYjsUpdates(docId)` afterwards and apply both in order: snapshot first,
+   * then each update in id order.
+   */
+  loadYjsSnapshot(docId: string): Uint8Array | undefined {
+    const row = this.db
+      .prepare("SELECT snapshot FROM yjs_local_state WHERE doc_id = ?")
+      .get(docId) as { snapshot: Buffer | Uint8Array } | undefined
+    if (!row) return undefined
+    return row.snapshot instanceof Buffer ? new Uint8Array(row.snapshot) : row.snapshot
+  }
+
+  /** Load all incremental updates for a doc, ordered by id. */
+  loadYjsUpdates(docId: string): Array<{ id: number; bytes: Uint8Array; origin: string; acked: boolean }> {
+    const rows = this.db
+      .prepare("SELECT id, bytes, origin, acked FROM yjs_local_updates WHERE doc_id = ? ORDER BY id ASC")
+      .all(docId) as Array<{ id: number; bytes: Buffer | Uint8Array; origin: string; acked: number }>
+    return rows.map((r) => ({
+      id: r.id,
+      bytes: r.bytes instanceof Buffer ? new Uint8Array(r.bytes) : r.bytes,
+      origin: r.origin,
+      acked: r.acked === 1,
+    }))
+  }
+
+  /** Append an update to the local store. Returns the new row id. */
+  appendYjsUpdate(docId: string, bytes: Uint8Array, origin: "local" | "remote", acked: boolean): number {
+    const result = this.db
+      .prepare("INSERT INTO yjs_local_updates (doc_id, bytes, origin, acked, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(docId, Buffer.from(bytes), origin, acked ? 1 : 0, Date.now())
+    return Number(result.lastInsertRowid)
+  }
+
+  /** All unacked local updates (origin='local' AND acked=0) for this doc, ordered by id. */
+  loadUnackedLocalUpdates(docId: string): Array<{ id: number; bytes: Uint8Array }> {
+    const rows = this.db
+      .prepare("SELECT id, bytes FROM yjs_local_updates WHERE doc_id = ? AND origin = 'local' AND acked = 0 ORDER BY id ASC")
+      .all(docId) as Array<{ id: number; bytes: Buffer | Uint8Array }>
+    return rows.map((r) => ({
+      id: r.id,
+      bytes: r.bytes instanceof Buffer ? new Uint8Array(r.bytes) : r.bytes,
+    }))
+  }
+
+  /** All unacked local updates across every doc (used to flush on reconnect). */
+  loadAllUnackedLocalUpdates(): Array<{ id: number; docId: string; bytes: Uint8Array }> {
+    const rows = this.db
+      .prepare("SELECT id, doc_id as docId, bytes FROM yjs_local_updates WHERE origin = 'local' AND acked = 0 ORDER BY id ASC")
+      .all() as Array<{ id: number; docId: string; bytes: Buffer | Uint8Array }>
+    return rows.map((r) => ({
+      id: r.id,
+      docId: r.docId,
+      bytes: r.bytes instanceof Buffer ? new Uint8Array(r.bytes) : r.bytes,
+    }))
+  }
+
+  markYjsUpdateAcked(id: number): void {
+    this.db.prepare("UPDATE yjs_local_updates SET acked = 1 WHERE id = ?").run(id)
+  }
+
+  /**
+   * Replace the snapshot and clear all updates whose id is <= upToId. Used by
+   * the compactor: after writing a fresh snapshot, the updates it subsumes are
+   * no longer needed.
+   */
+  replaceYjsSnapshot(docId: string, snapshot: Uint8Array, upToUpdateId: number, totalUpdatesAfter: number): void {
+    const buf = Buffer.from(snapshot)
+    const now = Date.now()
+    this.db.exec("BEGIN")
+    try {
+      this.db
+        .prepare(`
+          INSERT INTO yjs_local_state (doc_id, snapshot, update_count, updated_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(doc_id) DO UPDATE SET
+            snapshot = excluded.snapshot,
+            update_count = excluded.update_count,
+            updated_at = excluded.updated_at
+        `)
+        .run(docId, buf, totalUpdatesAfter, now)
+      this.db.prepare("DELETE FROM yjs_local_updates WHERE doc_id = ? AND id <= ?").run(docId, upToUpdateId)
+      this.db.exec("COMMIT")
+    } catch (err) {
+      this.db.exec("ROLLBACK")
+      throw err
+    }
+  }
+
+  /** Count of incremental updates for a doc (used by the compactor threshold). */
+  yjsUpdateCount(docId: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) as c FROM yjs_local_updates WHERE doc_id = ?")
+      .get(docId) as { c: number }
+    return row.c
+  }
+
+  /** Forget all Yjs persistence for a doc. Used when a file is deleted. */
+  purgeYjsForDoc(docId: string): void {
+    this.db.prepare("DELETE FROM yjs_local_state WHERE doc_id = ?").run(docId)
+    this.db.prepare("DELETE FROM yjs_local_updates WHERE doc_id = ?").run(docId)
   }
 
   close(): void {

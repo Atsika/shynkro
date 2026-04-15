@@ -37,6 +37,13 @@ export interface ChunkedDownloadResult {
 export interface ChunkedDownloaderDeps {
   baseUrl: string
   getToken: () => Promise<string | undefined>
+  /**
+   * H10: invoked with the destination path immediately before the atomic
+   * rename. The FileWatcher uses this to ignore the resulting onCreate event
+   * so a "Take theirs" pull doesn't trigger a spurious onBinaryChanged →
+   * upload loop.
+   */
+  addWriteTag?: (absPath: string) => void
 }
 
 export class ChunkedDownloader {
@@ -167,6 +174,10 @@ export class ChunkedDownloader {
       throw new Error(`download size mismatch: got ${result.received}, expected ${totalSize}`)
     }
 
+    // H10: Tag the destination so the FileWatcher's onCreate handler skips
+    // this write. Without the tag, every "Take theirs" pull would echo as a
+    // local change → spurious re-upload.
+    this.deps.addWriteTag?.(targetPath)
     // Atomic move into place.
     fs.renameSync(tmpPath, targetPath)
 

@@ -28,7 +28,6 @@
     "onCommand:shynkro.invite",
     "onView:shynkro.presenceView",
     "onView:shynkro.actionsView",
-    "onView:shynkro.conflictView",
     "onCommand:shynkro.setServerUrl"
   ],
   "main": "./out/extension.js",
@@ -109,30 +108,9 @@
       {
         "command": "shynkro.member.unfollow",
         "title": "Unfollow"
-      },
-      {
-        "command": "shynkro.acceptLocalHunk",
-        "title": "Shynkro: Accept My Changes"
-      },
-      {
-        "command": "shynkro.acceptServerHunk",
-        "title": "Shynkro: Accept Server's Changes"
       }
     ],
-    "keybindings": [
-      {
-        "command": "shynkro.acceptLocalHunk",
-        "key": "ctrl+shift+y",
-        "mac": "cmd+shift+y",
-        "when": "shynkro.hasActiveConflict"
-      },
-      {
-        "command": "shynkro.acceptServerHunk",
-        "key": "ctrl+shift+n",
-        "mac": "cmd+shift+n",
-        "when": "shynkro.hasActiveConflict"
-      }
-    ],
+    "keybindings": [],
     "menus": {
       "commandPalette": [
         { "command": "shynkro.trackFile", "when": "false" },

@@ -220,13 +220,27 @@ export class RestClient {
   }
 
   // Blobs
-  async uploadBlob(workspaceId: WorkspaceId, fileId: FileId, data: Uint8Array, hash: string, mode?: number | null): Promise<void> {
+  async uploadBlob(
+    workspaceId: WorkspaceId,
+    fileId: FileId,
+    data: Uint8Array,
+    hash: string,
+    mode?: number | null,
+    /**
+     * Concurrency guard for the binary conflict picker. When set, the server
+     * rejects with 412 if its current binaryHash for this file no longer
+     * matches — caller treats that as "another resolver already pushed" and
+     * re-opens the picker against the new server state.
+     */
+    ifMatch?: string | null,
+  ): Promise<void> {
     const token = await this.getToken()
     const headers: Record<string, string> = {
       "Content-Type": "application/octet-stream",
       "X-Content-Hash": hash,
     }
     if (mode !== undefined && mode !== null) headers["X-File-Mode"] = String(mode & 0o777)
+    if (ifMatch !== undefined && ifMatch !== null) headers["If-Match"] = ifMatch
     if (token) headers["Authorization"] = `Bearer ${token}`
     let res: Response
     try {
@@ -238,7 +252,14 @@ export class RestClient {
     } catch (err) {
       throw new Error(`Cannot connect to ${this.baseUrl} — ${err instanceof Error ? err.message : String(err)}`)
     }
-    if (!res.ok) throw new ApiError(res.status, "UPLOAD_FAILED", res.statusText)
+    if (!res.ok) {
+      // Surface 412 distinctly so the picker can react to "server moved" without
+      // treating it as a generic upload failure.
+      if (res.status === 412) {
+        throw new ApiError(412, "HASH_MISMATCH", await res.text().catch(() => res.statusText))
+      }
+      throw new ApiError(res.status, "UPLOAD_FAILED", res.statusText)
+    }
   }
 
   /**
