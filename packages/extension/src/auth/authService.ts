@@ -73,6 +73,10 @@ export class AuthService {
     await this.tokenStore.clearTokens(serverUrl)
   }
 
+  async hasCredentials(serverUrl: string): Promise<boolean> {
+    return !!(await this.tokenStore.getRefreshToken(serverUrl))
+  }
+
   async getValidAccessToken(serverUrl: string): Promise<string | undefined> {
     // If a refresh is in-flight, join it
     if (this.refreshPromise) return this.refreshPromise
@@ -99,23 +103,37 @@ export class AuthService {
     const refreshToken = await this.tokenStore.getRefreshToken(serverUrl)
     if (!refreshToken) throw new Error("No refresh token")
 
+    // Use a direct fetch — restClient.refresh() would call getToken() → getValidAccessToken()
+    // → return this.refreshPromise, causing a deadlock where the refresh waits for itself.
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 5000)
+    let res: Response
     try {
-      // Use a direct fetch — restClient.refresh() would call getToken() → getValidAccessToken()
-      // → return this.refreshPromise, causing a deadlock where the refresh waits for itself.
-      const res = await fetch(`${serverUrl}/api/v1/auth/refresh`, {
+      res = await fetch(`${serverUrl}/api/v1/auth/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refreshToken }),
+        signal: controller.signal,
       })
-      if (!res.ok) throw new Error(`Refresh failed: ${res.status}`)
-      const data = await res.json() as import("@shynkro/shared").AuthTokens
-      await this.tokenStore.setTokens(serverUrl, data.accessToken, data.refreshToken)
-      this.scheduleAutoRefresh(serverUrl, data.accessToken)
-      return data.accessToken
     } catch {
+      // Network error or timeout (server unreachable) — keep tokens intact so
+      // reconnect can retry once the server comes back up. Do NOT clear tokens here.
+      throw new Error("Server unreachable")
+    } finally {
+      clearTimeout(timeoutId)
+    }
+
+    if (!res.ok) {
+      // Server explicitly rejected the refresh token — session is truly invalid.
       await this.tokenStore.clearTokens(serverUrl)
+      vscode.window.showErrorMessage("Shynkro: session expired — please log in again.")
       throw new Error("Session expired — please log in again")
     }
+
+    const data = await res.json() as import("@shynkro/shared").AuthTokens
+    await this.tokenStore.setTokens(serverUrl, data.accessToken, data.refreshToken)
+    this.scheduleAutoRefresh(serverUrl, data.accessToken)
+    return data.accessToken
   }
 
   scheduleAutoRefresh(serverUrl: string, accessToken: string): void {

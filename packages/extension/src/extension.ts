@@ -8,9 +8,6 @@ import { RestClient } from "./api/restClient"
 import { StatusBar } from "./status/statusBar"
 import { WsManager } from "./ws/wsManager"
 import { StateDb } from "./state/stateDb"
-function makeStateDb(dbPath: string): StateDb {
-  return new StateDb(dbPath)
-}
 import { FileWatcher } from "./sync/fileWatcher"
 import { ChangeReconciler } from "./sync/changeReconciler"
 import { YjsBridge } from "./yjs/yjsBridge"
@@ -30,7 +27,10 @@ import { ConflictView } from "./views/conflictView"
 import { ConflictManager } from "./conflict/conflictManager"
 import { ConflictDecorations } from "./conflict/conflictDecorations"
 import { ConflictLensProvider } from "./conflict/conflictLens"
+import { SyncDecorationProvider } from "./views/syncDecorationProvider"
 import { SHYNKRO_DIR, PROJECT_JSON, EXTENSION_VERSION } from "./constants"
+import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
+import { decodeTextFile } from "./text/textNormalize"
 
 let stateDb: StateDb | null = null
 let wsManager: WsManager | null = null
@@ -44,6 +44,9 @@ let lockDir: string | null = null
 let shynkroDirWatcher: vscode.FileSystemWatcher | null = null
 let presenceView: PresenceView | null = null
 let conflictView: ConflictView | null = null
+let binarySyncInstance: BinarySync | null = null
+let syncDecoProviderInstance: SyncDecorationProvider | null = null
+let syncDecoRegistration: vscode.Disposable | null = null
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   try {
@@ -65,6 +68,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   )
   // ConflictView is registered after conflictManager is created in startSync
   vscode.commands.executeCommand("setContext", "shynkro.syncActive", false)
+
+  // Detect whether the user is already logged in (has a valid token from a
+  // previous session) so the command palette shows the right button from the
+  // start: "Login / Register" when logged out, "Logout" when logged in.
+  const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
+  const existingToken = await tokenStore.getAccessToken(serverUrl)
+  vscode.commands.executeCommand("setContext", "shynkro.loggedIn", !!existingToken)
 
   // Register commands
   context.subscriptions.push(
@@ -108,12 +118,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
+    // Login / Register: single command that shows a quick-pick. Visible only
+    // when NOT logged in (shynkro.loggedIn == false).
     vscode.commands.registerCommand("shynkro.login", async () => {
+      const choice = await vscode.window.showQuickPick(
+        [
+          { label: "$(sign-in) Login", description: "Sign in with an existing account", action: "login" as const },
+          { label: "$(person-add) Register", description: "Create a new account", action: "register" as const },
+        ],
+        { title: "Shynkro: Login / Register", placeHolder: "Choose an option" }
+      )
+      if (!choice) return
+
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
-      const ok = await authService!.login(serverUrl)
+
+      let ok = false
+      if (choice.action === "login") {
+        ok = await authService!.login(serverUrl)
+        if (ok) vscode.window.showInformationMessage("Shynkro: logged in")
+      } else {
+        ok = await authService!.register(serverUrl)
+        if (ok) vscode.window.showInformationMessage("Shynkro: registered and logged in")
+      }
+      vscode.commands.executeCommand("setContext", "shynkro.loggedIn", ok)
       if (ok) {
-        vscode.window.showInformationMessage("Shynkro: logged in")
         const found = findProjectConfig()
         if (found) {
           restClient.setBaseUrl(found.config.serverUrl)
@@ -122,25 +151,149 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("shynkro.register", async () => {
-      const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
-      restClient.setBaseUrl(serverUrl)
-      const ok = await authService!.register(serverUrl)
-      if (ok) {
-        vscode.window.showInformationMessage("Shynkro: registered and logged in")
-        const found = findProjectConfig()
-        if (found) {
-          restClient.setBaseUrl(found.config.serverUrl)
-          startSync(found.config.serverUrl, restClient, tokenStore, context).catch(() => {})
-        }
-      }
-    }),
-
+    // Logout: visible only when logged in (shynkro.loggedIn == true).
     vscode.commands.registerCommand("shynkro.logout", async () => {
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       await authService!.logout(serverUrl)
       stopSync()
+      vscode.commands.executeCommand("setContext", "shynkro.loggedIn", false)
       vscode.window.showInformationMessage("Shynkro: logged out")
+    }),
+
+    // Keep the register command as a no-op alias so the activation event
+    // in package.json doesn't break. It just forwards to the login quick-pick.
+    vscode.commands.registerCommand("shynkro.register", () => {
+      vscode.commands.executeCommand("shynkro.login")
+    }),
+
+    // Track / Untrack: right-click context menu on files in the explorer.
+    vscode.commands.registerCommand("shynkro.trackFile", async (uri: vscode.Uri) => {
+      if (!uri || !stateDb || !wsManager?.connected) {
+        vscode.window.showWarningMessage("Shynkro: sync must be active to track files.")
+        return
+      }
+      const found = findProjectConfig()
+      if (!found) return
+      const relPath = path.relative(found.root, uri.fsPath).replace(/\\/g, "/")
+
+      // Already tracked?
+      if (stateDb.getFileByPath(relPath)) {
+        vscode.window.showInformationMessage(`Shynkro: "${path.basename(relPath)}" is already tracked.`)
+        return
+      }
+
+      // Case-insensitive collision check
+      const ciCollision = stateDb.getFileByPathCI(relPath)
+      if (ciCollision && ciCollision.path !== relPath) {
+        vscode.window.showWarningMessage(
+          `Shynkro: cannot track "${path.basename(relPath)}" — "${path.basename(ciCollision.path)}" already exists (case-insensitive match).`
+        )
+        return
+      }
+
+      let stat: fs.Stats
+      try {
+        stat = fs.lstatSync(uri.fsPath)
+      } catch {
+        vscode.window.showErrorMessage(`Shynkro: file not found: ${relPath}`)
+        return
+      }
+      if (stat.isSymbolicLink()) {
+        vscode.window.showWarningMessage("Shynkro: symlinks cannot be tracked.")
+        return
+      }
+
+      // classifyFile + classifyFileWithContent imported at module top
+      let kind = stat.isDirectory() ? "folder" as const : classifyFile(uri.fsPath)
+      if (kind === null) {
+        try {
+          const fd = fs.openSync(uri.fsPath, "r")
+          try {
+            const sniff = Buffer.alloc(Math.min(4096, stat.size))
+            if (sniff.length > 0) fs.readSync(fd, sniff, 0, sniff.length, 0)
+            kind = classifyFileWithContent(uri.fsPath, sniff)
+          } finally {
+            fs.closeSync(fd)
+          }
+        } catch {
+          kind = "text"
+        }
+      }
+
+      let content: string | undefined
+      if (kind === "text") {
+        try {
+          const decoded = decodeTextFile(fs.readFileSync(uri.fsPath, "utf-8"))
+          content = decoded.content
+        } catch { /* fall through — content stays undefined */ }
+      }
+
+      const mode = process.platform !== "win32" && stat.isFile() ? (stat.mode & 0o777) : undefined
+
+      try {
+        const file = await restClient.createFile(found.config.workspaceId, {
+          path: relPath,
+          kind,
+          content,
+          mode,
+        })
+        stateDb.upsertFile(file.id, relPath, kind, file.docId ?? undefined)
+        if (mode !== undefined) stateDb.setFileMode(file.id, mode)
+        vscode.window.showInformationMessage(`Shynkro: now tracking "${path.basename(relPath)}"`)
+        log.appendLine(`[track] tracked ${relPath} id=${file.id}`)
+        syncDecoProviderInstance?.refresh([uri])
+
+        if (kind === "binary" && binarySyncInstance) {
+          binarySyncInstance.upload(
+            file.id as import("@shynkro/shared").FileId,
+            uri.fsPath,
+            found.config.workspaceId
+          ).catch((e) => log.appendLine(`[track] binary upload error: ${e}`))
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        vscode.window.showErrorMessage(`Shynkro: failed to track "${path.basename(relPath)}" — ${msg}`)
+      }
+    }),
+
+    vscode.commands.registerCommand("shynkro.untrackFile", async (uri: vscode.Uri) => {
+      if (!uri || !stateDb || !wsManager?.connected) {
+        vscode.window.showWarningMessage("Shynkro: sync must be active to untrack files.")
+        return
+      }
+      const found = findProjectConfig()
+      if (!found) return
+      const relPath = path.relative(found.root, uri.fsPath).replace(/\\/g, "/")
+      const row = stateDb.getFileByPath(relPath)
+      if (!row) {
+        vscode.window.showInformationMessage(`Shynkro: "${path.basename(relPath)}" is not tracked.`)
+        return
+      }
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Shynkro: untrack "${path.basename(relPath)}"? This removes the file from the shared workspace for all collaborators. Your local copy will be kept.`,
+        { modal: true },
+        "Untrack"
+      )
+      if (confirm !== "Untrack") return
+
+      try {
+        // Tell the reconciler to skip the local rm when the server echoes
+        // back the fileDeleted broadcast — the user wants to keep their copy.
+        changeReconciler?.markUntracked(relPath)
+        // E9: Set write tag BEFORE the REST call — the server's fileDeleted
+        // broadcast can arrive before the REST response, and the watcher needs
+        // the tag to suppress a duplicate delete.
+        fileWatcher?.addWriteTag(uri.fsPath)
+        await restClient.deleteFile(found.config.workspaceId, row.fileId as import("@shynkro/shared").FileId)
+        stateDb.deleteFile(row.fileId)
+        vscode.window.showInformationMessage(`Shynkro: "${path.basename(relPath)}" untracked. Local copy kept.`)
+        log.appendLine(`[untrack] untracked ${relPath}`)
+        syncDecoProviderInstance?.refresh([uri])
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        vscode.window.showErrorMessage(`Shynkro: failed to untrack "${path.basename(relPath)}" — ${msg}`)
+      }
     }),
 
     vscode.commands.registerCommand("shynkro.init", async () => {
@@ -148,14 +301,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!folders) { vscode.window.showErrorMessage("Open a folder first"); return }
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
-      await executeInit(folders[0].uri.fsPath, serverUrl, authService!, restClient, makeStateDb)
+      await executeInit(folders[0].uri.fsPath, serverUrl, authService!, restClient, (p: string) => new StateDb(p))
       await startSync(serverUrl, restClient, tokenStore, context)
     }),
 
     vscode.commands.registerCommand("shynkro.clone", async () => {
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
-      await executeClone(serverUrl, authService!, restClient, makeStateDb, () =>
+      await executeClone(serverUrl, authService!, restClient, (p: string) => new StateDb(p), () =>
         startSync(serverUrl, restClient, tokenStore, context)
       )
     }),
@@ -171,7 +324,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const workspaceId = await executeJoin(serverUrl, authService!, restClient)
       if (!workspaceId) return
       // After joining, offer to download the files (same flow as clone)
-      await executeClone(serverUrl, authService!, restClient, makeStateDb, () =>
+      await executeClone(serverUrl, authService!, restClient, (p: string) => new StateDb(p), () =>
         startSync(serverUrl, restClient, tokenStore, context),
         workspaceId
       )
@@ -347,7 +500,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const dbPath = path.join(shynkroDir, "state.db")
 
             // Rebuild stateDb from snapshot
-            const db = makeStateDb(dbPath)
+            const db = new StateDb(dbPath)
             db.clearForRelink()
             for (const file of snapshot.files) {
               db.upsertFile(file.fileId, file.path, file.kind, file.docId ?? undefined, file.hash)
@@ -416,7 +569,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 function semverGte(a: string, b: string): boolean {
-  const parse = (v: string) => v.split(".").map(Number)
+  // M2: Use parseInt to handle pre-release suffixes (e.g. "1.2.3-beta") without NaN
+  const parse = (v: string) => v.split(".").map((s) => parseInt(s, 10) || 0)
   const [aMaj, aMin, aPat] = parse(a)
   const [bMaj, bMin, bPat] = parse(b)
   if (aMaj !== bMaj) return aMaj > bMaj
@@ -424,7 +578,28 @@ function semverGte(a: string, b: string): boolean {
   return aPat >= bPat
 }
 
+/** E2: Guard against concurrent startSync calls */
+let startSyncRunning = false
+
 async function startSync(
+  serverUrl: string,
+  restClient: RestClient,
+  _tokenStore: TokenStore,
+  context: vscode.ExtensionContext
+): Promise<void> {
+  if (startSyncRunning) {
+    log.appendLine("[sync] startSync already in progress — skipping")
+    return
+  }
+  startSyncRunning = true
+  try {
+    await _startSyncInner(serverUrl, restClient, _tokenStore, context)
+  } finally {
+    startSyncRunning = false
+  }
+}
+
+async function _startSyncInner(
   serverUrl: string,
   restClient: RestClient,
   _tokenStore: TokenStore,
@@ -461,7 +636,7 @@ async function startSync(
 
   const dbPath = path.join(shynkroDir, "state.db")
   log.appendLine(`[sync] opening stateDb at ${dbPath}`)
-  stateDb = makeStateDb(dbPath)
+  stateDb = new StateDb(dbPath)
   // Prune stale tombstones so long-running workspaces don't grow the SQLite
   // file unbounded over months. Default is 30 days; tombstones are normally
   // cleared by purgeFile as soon as the server confirms a delete, so this
@@ -484,13 +659,14 @@ async function startSync(
     baseUrl: serverUrl,
     getToken: () => authService!.getValidAccessToken(serverUrl).catch(() => undefined),
   })
-  const binarySync = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher, {
+  binarySyncInstance = new BinarySync(restClient, stateDb, workspaceRoot, fileWatcher, {
     uploader: chunkedUploader,
     downloader: chunkedDownloader,
   })
+  const binarySync = binarySyncInstance
   changeReconciler = new ChangeReconciler(
     config.workspaceId, workspaceRoot, stateDb, restClient, fileWatcher,
-    binarySync
+    binarySync!
   )
 
   const conflictDecorations = new ConflictDecorations()
@@ -503,15 +679,32 @@ async function startSync(
     conflictDecorations,
     conflictLensProvider
   )
-  yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager, stateDb, workspaceRoot)
+  yjsBridge = new YjsBridge(wsManager, fileWatcher, conflictManager, stateDb, workspaceRoot, restClient)
 
   // Register conflict view now that conflictManager is available
   conflictView?.dispose()
   conflictView = new ConflictView(conflictManager)
+  // File decorations: "S" badge on synced files, "!" on conflicts.
+  // Dispose any prior registration so a reconnect doesn't stack duplicate badges.
+  syncDecoRegistration?.dispose()
+  syncDecoProviderInstance?.dispose()
+  const syncDecoProvider = new SyncDecorationProvider(workspaceRoot, stateDb, conflictManager)
+  syncDecoProviderInstance = syncDecoProvider
+  syncDecoRegistration = vscode.window.registerFileDecorationProvider(syncDecoProvider)
   context.subscriptions.push(
     conflictDecorations,
     vscode.languages.registerCodeLensProvider({ scheme: "file" }, conflictLensProvider),
-    vscode.window.registerTreeDataProvider("shynkro.conflictView", conflictView)
+    vscode.window.registerTreeDataProvider("shynkro.conflictView", conflictView),
+    syncDecoRegistration,
+    syncDecoProvider,
+    // M8: Refresh file badges when conflicts change — use targeted URIs from
+    // the conflict list to avoid full-tree invalidation.
+    conflictManager.onListChanged(() => {
+      const cm = conflictManager
+      if (!cm) return
+      const uris = cm.getConflicts().map((c) => vscode.Uri.file(c.filePath))
+      syncDecoProvider.refresh(uris.length > 0 ? uris : undefined)
+    })
   )
 
   // Wire WS events
@@ -539,11 +732,35 @@ async function startSync(
       yjsBridge?.handleFileDeleted(absPath, { remote: false }).catch((err) =>
         log.appendLine(`[sync] handleFileDeleted (local) error: ${err}`)
       )
+      syncDecoProvider.refresh([vscode.Uri.file(absPath)])
     }),
     changeReconciler.onRemoteFileDeleted(({ absPath }) => {
       yjsBridge?.handleFileDeleted(absPath, { remote: true }).catch((err) =>
         log.appendLine(`[sync] handleFileDeleted (remote) error: ${err}`)
       )
+      syncDecoProvider.refresh([vscode.Uri.file(absPath)])
+    })
+  )
+
+  // Refresh sync decorations when new files become tracked (local create,
+  // remote create via reconciler, text file registration for Yjs).
+  context.subscriptions.push(
+    fileWatcher.onTextFileRegistered((fsPath) => {
+      syncDecoProvider.refresh([vscode.Uri.file(fsPath)])
+    }),
+    fileWatcher.onBinaryChanged(({ localPath }) => {
+      syncDecoProvider.refresh([vscode.Uri.file(localPath)])
+    }),
+    changeReconciler.onTextFileRegistered((fsPath) => {
+      syncDecoProvider.refresh([vscode.Uri.file(fsPath)])
+    }),
+    // Refresh decorations for ANY file type (binary, folder, text) tracked
+    // by the reconciler — covers WS-driven creates that bypass the text-only
+    // events above. Also refreshes parent directories so folder badges update.
+    changeReconciler.onFileTracked((fsPath) => {
+      const uri = vscode.Uri.file(fsPath)
+      const parentUri = vscode.Uri.file(path.dirname(fsPath))
+      syncDecoProvider.refresh([uri, parentUri])
     })
   )
 
@@ -597,6 +814,11 @@ async function startSync(
                   "Shynkro: server is shutting down. Sync will resume on reconnect."
                 )
               }
+              // Close our end cleanly so the server drain sees the count drop
+              // immediately instead of waiting for the force-close timeout.
+              // closeForReconnect() lets the close handler run so the reconnect
+              // loop stays active and picks the server back up when it restarts.
+              wsManager?.closeForReconnect()
             })
         }
         return
@@ -663,6 +885,7 @@ async function startSync(
           }
         })
       } else if (msg.type === "presenceUpdate") {
+        log.appendLine(`[sync] presenceUpdate: ${msg.users.length} user(s) — ${msg.users.map((u: { username: string }) => u.username).join(", ")}`)
         presenceView?.updateUsers(msg.users, wsManager!.userId)
         const followedId = yjsBridge?.followedUserId
         if (followedId && !msg.users.some((u) => u.userId === followedId)) {
@@ -693,9 +916,11 @@ async function startSync(
           })
           .catch(() => {})
           .finally(() => {
-            changeReconciler?.reconcile().catch((err) => {
-              log.appendLine(`[sync] reconcile error: ${err}`)
-            })
+            changeReconciler?.reconcile()
+              .then(() => syncDecoProviderInstance?.refresh())
+              .catch((err) => {
+                log.appendLine(`[sync] reconcile error: ${err}`)
+              })
           })
 
         changeReconciler?.startPolling()
@@ -745,6 +970,10 @@ async function startSync(
 }
 
 function stopSync(): void {
+  syncDecoRegistration?.dispose()
+  syncDecoRegistration = null
+  syncDecoProviderInstance?.dispose()
+  syncDecoProviderInstance = null
   conflictView?.dispose()
   conflictView = null
   conflictManager?.dispose()

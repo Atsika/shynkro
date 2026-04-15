@@ -3,6 +3,7 @@ import * as path from "path"
 import * as vscode from "vscode"
 import * as Y from "yjs"
 import { WS_BINARY_YJS_UPDATE, WS_BINARY_YJS_STATE, WS_BINARY_AWARENESS } from "@shynkro/shared"
+import type { RestClient } from "../api/restClient"
 import type { CursorPayload, DocId, FileId, Role, WorkspaceId } from "@shynkro/shared"
 import type { WsManager } from "../ws/wsManager"
 import type { FileWatcher } from "../sync/fileWatcher"
@@ -69,16 +70,16 @@ interface DocEntry {
   conflictServerDoc: Y.Doc | null
   /** The server text when the conflict was started — used to detect server changes during resolution. */
   conflictOriginalServerText: string | null
-  /**
-   * Frames that arrived during the narrow window of applyFinalText where
-   * `conflictServerDoc` has been destroyed but `pendingConflict` is still true.
-   * Drained into `yDoc` at the end of applyFinalText, before `pendingConflict` is
-   * cleared. Ensures no server update can slip through and silently overwrite
-   * the user's resolution even if a future refactor introduces a yield point
-   * in the conflict tail (today the window is zero ticks, but this is cheap
-   * insurance against regression).
-   */
-  conflictBufferedFrames: Uint8Array[] | null
+  /** Last known common base text — used as the 3-way merge anchor. Set when the initial
+   *  server state is applied successfully and after each conflict resolution. */
+  baseText: string | null
+  /** Last cursor payload that arrived while applyingRemote > 0 (full-doc replace in-flight). */
+  pendingCursor: CursorPayload | null
+  /** Set after applyFinalText succeeds so the next 0x02 echo from the server
+   *  rebuilds (replaces) the local Y.Doc rather than merging — merging two
+   *  independently-created Y.Docs with the same text but different Yjs histories
+   *  doubles the content. */
+  awaitingForcedState: boolean
 }
 
 interface BackgroundEntry {
@@ -88,6 +89,7 @@ interface BackgroundEntry {
   writeTimer: ReturnType<typeof setTimeout> | null
   hasReceivedState: boolean
   pendingConflict: boolean
+  baseText: string | null
 }
 
 function uuidToBytes(uuid: string): Uint8Array {
@@ -143,15 +145,17 @@ export class YjsBridge {
     private readonly fileWatcher: FileWatcher,
     private readonly conflictManager: ConflictManager,
     private readonly stateDb: import("../state/stateDb").StateDb,
-    private readonly workspaceRoot: string
+    private readonly workspaceRoot: string,
+    private readonly restClient: RestClient
   ) {
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.handleBinaryFrame(frame)),
       vscode.workspace.onDidChangeTextDocument((e) => this.handleLocalEdit(e)),
       vscode.workspace.onDidCloseTextDocument((doc) => this.handleDocClose(doc)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
-        // Viewer read-only enforcement
-        if (editor && this.currentRole === "viewer" && this.isTrackedPath(editor.document.uri.fsPath)) {
+        // Viewer read-only enforcement — applies to all workspace files, not just
+        // Yjs-bridged ones, so binary/folder/unbridged files are also locked.
+        if (editor && this.currentRole === "viewer" && editor.document.uri.scheme === "file" && this.isWorkspacePath(editor.document.uri.fsPath)) {
           vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
           const docEntry = [...this.docs.values()].find(e => e.editor.document === editor.document)
           if (docEntry) this.showPermissionRequestPopup(docEntry.workspaceId)
@@ -190,29 +194,11 @@ export class YjsBridge {
   openDoc(fileId: FileId, docId: DocId, workspaceId: WorkspaceId, filePath: string, editor: vscode.TextEditor): void {
     const existing = this.docs.get(docId)
     if (existing) {
-      // Update editor reference in case it changed (e.g. after reload)
       existing.editor = editor
       return
     }
 
-    // Evict stale entries for the same file path (e.g. file was deleted and recreated with a new docId)
-    for (const [oldDocId, oldEntry] of this.docs) {
-      if (oldEntry.filePath === filePath && oldDocId !== docId) {
-        log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
-        const oldHandler = this.updateHandlers.get(oldDocId)
-        if (oldHandler) { oldEntry.yDoc.off("update", oldHandler); this.updateHandlers.delete(oldDocId) }
-        oldEntry.yDoc.destroy()
-        this.docs.delete(oldDocId)
-      }
-    }
-    for (const [oldDocId, oldBg] of this.backgroundDocs) {
-      if (oldBg.filePath === filePath && oldDocId !== docId) {
-        log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
-        if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
-        oldBg.yDoc.destroy()
-        this.backgroundDocs.delete(oldDocId)
-      }
-    }
+    this.evictStaleEntriesForPath(filePath, docId)
 
     let yDoc: Y.Doc
     const bgEntry = this.backgroundDocs.get(docId)
@@ -240,7 +226,9 @@ export class YjsBridge {
       pendingConflict: hasSuspendedConflict || !!(bgEntry?.pendingConflict),
       conflictServerDoc: null,
       conflictOriginalServerText: null,
-      conflictBufferedFrames: null,
+      baseText: bgEntry?.baseText ?? null,
+      pendingCursor: null,
+      awaitingForcedState: false,
     }
     this.docs.set(docId, entry)
 
@@ -276,33 +264,35 @@ export class YjsBridge {
   subscribeBackground(docId: string, workspaceId: WorkspaceId, filePath: string): void {
     if (this.docs.has(docId) || this.backgroundDocs.has(docId)) return
 
-    // Evict stale entries for the same file path
-    for (const [oldDocId, oldEntry] of this.docs) {
-      if (oldEntry.filePath === filePath && oldDocId !== docId) {
-        log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
-        const oldHandler = this.updateHandlers.get(oldDocId)
-        if (oldHandler) { oldEntry.yDoc.off("update", oldHandler); this.updateHandlers.delete(oldDocId) }
-        oldEntry.yDoc.destroy()
-        this.docs.delete(oldDocId)
-      }
-    }
-    for (const [oldDocId, oldBg] of this.backgroundDocs) {
-      if (oldBg.filePath === filePath && oldDocId !== docId) {
-        log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
-        if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
-        oldBg.yDoc.destroy()
-        this.backgroundDocs.delete(oldDocId)
-      }
-    }
+    this.evictStaleEntriesForPath(filePath, docId)
 
     log.appendLine(`[yjsBridge] subscribeBackground ${path.basename(filePath)}`)
     const yDoc = new Y.Doc()
-    this.backgroundDocs.set(docId, { yDoc, filePath, workspaceId, writeTimer: null, hasReceivedState: false, pendingConflict: false })
+    this.backgroundDocs.set(docId, { yDoc, filePath, workspaceId, writeTimer: null, hasReceivedState: false, pendingConflict: false, baseText: null })
     this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
   }
 
   private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
     return this.updateHandlers.get(docId) ?? (() => {})
+  }
+
+  /** Evict stale doc/background entries for the same file path (e.g. file deleted and recreated with a new docId). */
+  private evictStaleEntriesForPath(filePath: string, exceptDocId: string): void {
+    for (const [oldDocId, oldEntry] of this.docs) {
+      if (oldEntry.filePath !== filePath || oldDocId === exceptDocId) continue
+      log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
+      const h = this.updateHandlers.get(oldDocId)
+      if (h) { oldEntry.yDoc.off("update", h); this.updateHandlers.delete(oldDocId) }
+      oldEntry.yDoc.destroy()
+      this.docs.delete(oldDocId)
+    }
+    for (const [oldDocId, oldBg] of this.backgroundDocs) {
+      if (oldBg.filePath !== filePath || oldDocId === exceptDocId) continue
+      log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
+      if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
+      oldBg.yDoc.destroy()
+      this.backgroundDocs.delete(oldDocId)
+    }
   }
 
   /** Re-subscribe all open + background docs after a reconnect. */
@@ -353,9 +343,21 @@ export class YjsBridge {
       this.permissionPopupShown = false
       this.setViewerStatusBar(false)
       if (wasViewer) {
-        // Unlock ALL tracked visible editors — session-readonly is per-document so we must
+        // Unlock ALL open workspace tabs — session-readonly is per-document so we must
         // temporarily focus each locked tab and run the command, then restore focus.
         this.unlockAllTrackedEditors()
+        // Clear any stale conflicts from the viewer phase — viewers can't have
+        // real local edits, so any conflict was a false positive (e.g. REST/Yjs
+        // race during initial sync).
+        for (const [docId, entry] of this.docs) {
+          if (entry.pendingConflict) {
+            entry.pendingConflict = false
+            entry.conflictServerDoc?.destroy()
+            entry.conflictServerDoc = null
+            entry.conflictOriginalServerText = null
+            this.conflictManager.clear(docId)
+          }
+        }
         // Resync all open docs: editor may have drifted from Yjs while viewer.
         // Without this, handleLocalEdit would compute wrong offsets and corrupt the Yjs doc.
         for (const entry of this.docs.values()) {
@@ -385,16 +387,14 @@ export class YjsBridge {
     }
   }
 
-  /** Inverse of unlockAllTrackedEditors — session-readonly every visible tracked editor. */
+  /** Session-readonly every open workspace tab (not just visible editors). */
   private lockAllTrackedEditors(): void {
-    const toLock = vscode.window.visibleTextEditors.filter(
-      (e) => e.document.uri.scheme === "file" && this.isTrackedPath(e.document.uri.fsPath)
-    )
-    if (toLock.length === 0) return
+    const urisToLock = this.collectWorkspaceTabUris()
+    if (urisToLock.length === 0) return
     const original = vscode.window.activeTextEditor
     ;(async () => {
-      for (const editor of toLock) {
-        await vscode.window.showTextDocument(editor.document, { preserveFocus: false, preview: false })
+      for (const uri of urisToLock) {
+        await vscode.window.showTextDocument(uri, { preserveFocus: false, preview: false })
         await vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
       }
       if (original) {
@@ -408,14 +408,12 @@ export class YjsBridge {
   }
 
   private unlockAllTrackedEditors(): void {
-    const toUnlock = vscode.window.visibleTextEditors.filter(
-      (e) => e.document.uri.scheme === "file" && this.isTrackedPath(e.document.uri.fsPath)
-    )
-    if (toUnlock.length === 0) return
+    const urisToUnlock = this.collectWorkspaceTabUris()
+    if (urisToUnlock.length === 0) return
     const original = vscode.window.activeTextEditor
     ;(async () => {
-      for (const editor of toUnlock) {
-        await vscode.window.showTextDocument(editor.document, { preserveFocus: false, preview: false })
+      for (const uri of urisToUnlock) {
+        await vscode.window.showTextDocument(uri, { preserveFocus: false, preview: false })
         await vscode.commands.executeCommand("workbench.action.files.setActiveEditorWriteableInSession")
       }
       if (original) {
@@ -424,8 +422,35 @@ export class YjsBridge {
     })().catch(() => {})
   }
 
+  /** Collect URIs of all open workspace tabs (visible + background). */
+  private collectWorkspaceTabUris(): vscode.Uri[] {
+    const seen = new Set<string>()
+    const uris: vscode.Uri[] = []
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        // M7: Use instanceof for type-safe narrowing instead of structural cast
+        if (!(tab.input instanceof vscode.TabInputText)) continue
+        const uri = tab.input.uri
+        if (
+          uri.scheme === "file" &&
+          this.isWorkspacePath(uri.fsPath) &&
+          !seen.has(uri.fsPath)
+        ) {
+          seen.add(uri.fsPath)
+          uris.push(uri)
+        }
+      }
+    }
+    return uris
+  }
+
   private isTrackedPath(fsPath: string): boolean {
     return this.findDocIdForPath(fsPath) !== null
+  }
+
+  /** True if the path is under the synced workspace root (used for viewer lock scope). */
+  private isWorkspacePath(fsPath: string): boolean {
+    return fsPath === this.workspaceRoot || fsPath.startsWith(this.workspaceRoot + path.sep)
   }
 
   private findDocIdForPath(fsPath: string): string | null {
@@ -476,6 +501,7 @@ export class YjsBridge {
           this.wsManager.sendJson({ type: "unsubscribeDoc", docId: docId as DocId })
           bg.yDoc.destroy()
           this.backgroundDocs.delete(docId)
+          this.conflictManager.clear(docId)
           log.appendLine(`[yjsBridge] closed background doc for deleted file ${path.basename(absPath)}`)
           return
         }
@@ -543,6 +569,11 @@ export class YjsBridge {
    * format from the disk content and remember it for future write-backs.
    */
   handleExternalTextEdit(filePath: string, docId: string): void {
+    // Viewers must not propagate edits — the server would reject the Yjs frame
+    // anyway (realtime.ts viewer check), but skipping here avoids a wasted
+    // round-trip and prevents the local Y.Doc from diverging from the server.
+    if (this.currentRole === "viewer") return
+
     let rawDiskText: string
     try {
       rawDiskText = fs.readFileSync(filePath, "utf-8")
@@ -629,14 +660,9 @@ export class YjsBridge {
               log.appendLine(`[yjsBridge] updated conflictServerDoc from WS_BINARY_YJS_STATE for ${path.basename(entry.filePath)}`)
               return
             }
-            // pendingConflict=true but no conflictServerDoc — this is the tail of
-            // applyFinalText, between `conflictServerDoc = null` and `pendingConflict = false`.
-            // Buffer the frame and drain it when applyFinalText finishes, rather than
-            // dropping it silently. Prevents a future async refactor from turning this
-            // into a silent-overwrite path.
-            if (!entry.conflictBufferedFrames) entry.conflictBufferedFrames = []
-            entry.conflictBufferedFrames.push(frame.data)
-            log.appendLine(`[yjsBridge] buffered state frame during conflict tail for ${path.basename(entry.filePath)}`)
+            // pendingConflict=true but no conflictServerDoc — applyFinalText is
+            // completing synchronously in this same tick. Drop the frame; the fresh
+            // yDoc will get a full state on the next subscribeDoc cycle.
             return
           }
 
@@ -651,6 +677,16 @@ export class YjsBridge {
           const editorText = toLf(entry.editor.document.getText())
 
           if (editorText !== serverText && editorText.length > 0 && serverText.length > 0) {
+            // Viewers can never have real local edits — any difference is just the
+            // server having newer content (e.g. REST-seeded file is older than the
+            // Yjs state frame). Accept server state without conflict detection.
+            if (this.currentRole === "viewer") {
+              log.appendLine(`[yjsBridge] viewer divergence — accepting server state silently: ${path.basename(entry.filePath)}`)
+              Y.applyUpdate(entry.yDoc, frame.data, "remote")
+              this.applyDocToEditor(entry, 3, () => { entry.hasReceivedState = true })
+              return
+            }
+
             // Check if the divergence is just a stale editor buffer — e.g. the file was
             // overwritten on disk by a clone without VS Code reloading the open editor.
             // If disk already has the server content and the user hasn't made unsaved edits,
@@ -671,14 +707,27 @@ export class YjsBridge {
               // Genuine divergence — let user resolve
               log.appendLine(`[yjsBridge] DIVERGED ${path.basename(entry.filePath)}: local=${editorText.length}, server=${serverText.length}`)
               entry.pendingConflict = true
-              this.offerReconnectChoice(entry, frame.docId, frame.data, editorText, serverText)
+              this.offerReconnectChoice(entry, frame.docId, frame.data, editorText, serverText, entry.baseText ?? "")
             }
           } else {
-            // No divergence — apply server state normally
-            Y.applyUpdate(entry.yDoc, frame.data, "remote")
-            this.applyDocToEditor(entry, 3, () => {
+            // No divergence — apply server state.
+            if (entry.awaitingForcedState) {
+              // After a force-set, rebuild (replace) from the server's state instead
+              // of merging. Y.applyUpdate on two independently-created Y.Docs that
+              // both contain the same text but have different Yjs histories (different
+              // clientIDs) would produce doubled content.
+              entry.awaitingForcedState = false
+              this.rebuildYDoc(entry, frame.docId, frame.data)
               entry.hasReceivedState = true
-            })
+              entry.baseText = serverText
+              // Editor already has the correct content from applyFinalText — skip push.
+            } else {
+              Y.applyUpdate(entry.yDoc, frame.data, "remote")
+              this.applyDocToEditor(entry, 3, () => {
+                entry.hasReceivedState = true
+                entry.baseText = serverText
+              })
+            }
           }
         } else {
           // Incremental update path.
@@ -697,12 +746,7 @@ export class YjsBridge {
               // push the update through applyDocToEditor (which would clobber markers).
               return
             }
-            // Conflict tail window (same as state-frame path): buffer and drain
-            // at the end of applyFinalText. Keeps the fresh yDoc up-to-date with
-            // any remote updates that slipped in between destroy and rebuild.
-            if (!entry.conflictBufferedFrames) entry.conflictBufferedFrames = []
-            entry.conflictBufferedFrames.push(frame.data)
-            log.appendLine(`[yjsBridge] buffered update frame during conflict tail for ${path.basename(entry.filePath)}`)
+            // applyFinalText is completing synchronously — drop the frame.
             return
           }
 
@@ -713,10 +757,23 @@ export class YjsBridge {
           if (before !== after) {
             log.appendLine(`[yjsBridge] update applied ${path.basename(entry.filePath)}: ${before.length} → ${after.length}`)
             this.applyDocToEditor(entry)
+            entry.baseText = after
           }
         }
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
-        // Awareness (cursor/selection) — only meaningful when doc is open in an editor
+        // Awareness (cursor/selection) — only meaningful when doc is open in an editor.
+        // Gate on applyingRemote: when a full-document replace is in-flight (async),
+        // applying decorations would flash at the wrong position because the editor
+        // still has the old content. Buffer the payload and drain after applyDocToEditor.
+        if (entry.applyingRemote > 0) {
+          try {
+            const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
+            if (payload.userId !== this.wsManager.userId) {
+              entry.pendingCursor = payload
+            }
+          } catch {}
+          return
+        }
         try {
           const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
           if (payload.userId !== this.wsManager.userId) {
@@ -792,7 +849,7 @@ export class YjsBridge {
    */
   private offerReconnectChoice(
     entry: DocEntry, docId: string, serverStateData: Uint8Array,
-    localText: string, serverText: string
+    localText: string, serverText: string, baseText: string
   ): void {
     // Build a shadow Y.Doc that will track the server state throughout conflict resolution.
     // Any WS_BINARY_YJS_STATE / WS_BINARY_YJS_UPDATE that arrives while the conflict is
@@ -809,6 +866,7 @@ export class YjsBridge {
       entry.editor,
       localText,
       serverText,
+      baseText,
       (finalText) => {
         // pendingConflict stays true until applyFinalText completes —
         // this blocks any WS_BINARY_YJS_STATE that arrives during the Y.Doc rebuild.
@@ -872,108 +930,75 @@ export class YjsBridge {
       entry.conflictOriginalServerText = null
       // pendingConflict stays true — offerReconnectChoice will start a new conflict
       log.appendLine(`[yjsBridge] server changed during conflict resolution for ${path.basename(entry.filePath)} — restarting`)
-      this.offerReconnectChoice(entry, docId, latestServerData, finalText, latestServerText)
+      this.offerReconnectChoice(entry, docId, latestServerData, finalText, latestServerText, finalText)
       return
     }
 
-    // Proceed: build a fresh Y.Doc from the latest server baseline.
-    const latestServerData = Y.encodeStateAsUpdate(entry.conflictServerDoc)
     entry.conflictServerDoc.destroy()
     entry.conflictServerDoc = null
     entry.conflictOriginalServerText = null
 
+    // Force-set the server document to the resolved text via REST.
+    // This bypasses Yjs CRDT merge entirely: the server replaces all Yjs history
+    // with a fresh doc containing finalText, then broadcasts the new state to all
+    // subscribers as WS_BINARY_YJS_STATE. Other clients in conflict mode will
+    // receive this clean state and can resolve against their own local version.
+    const workspaceId = entry.workspaceId
+    const fileId = entry.fileId
+
+    this.restClient.forceSetDocContent(workspaceId, fileId, finalText).then(() => {
+      // Rebuild local Y.Doc to match the resolved text so the local state is
+      // consistent with the server. The server will also broadcast WS_BINARY_YJS_STATE
+      // which will arrive and be a no-op (same text, no divergence).
+      const freshDoc = new Y.Doc()
+      if (finalText.length > 0) freshDoc.getText("content").insert(0, finalText)
+      const freshState = Y.encodeStateAsUpdate(freshDoc)
+      freshDoc.destroy()
+
+      const currentEntry = this.docs.get(docId)
+      if (currentEntry) {
+        this.rebuildYDoc(currentEntry, docId, freshState)
+        this.applyDocToEditor(currentEntry)
+        currentEntry.baseText = finalText
+        currentEntry.pendingConflict = false
+        currentEntry.hasReceivedState = true
+        // Signal the 0x02 echo handler to rebuild from the server state rather
+        // than merge — two independently-created Y.Docs with the same text but
+        // different Yjs histories would double the content if merged.
+        currentEntry.awaitingForcedState = true
+      }
+      log.appendLine(`[yjsBridge] conflict resolved via force-set for ${path.basename(entry.filePath)}: ${finalText.length} chars`)
+    }).catch((err) => {
+      log.appendLine(`[yjsBridge] force-set failed for ${path.basename(entry.filePath)}: ${err} — falling back to server state`)
+      const currentEntry = this.docs.get(docId)
+      if (currentEntry) {
+        currentEntry.pendingConflict = false
+        // Entry's yDoc is in an indeterminate state; re-subscribe will fix it on next reconnect.
+      }
+    })
+  }
+
+  /** Destroy the old Y.Doc, create a fresh one from server data, and rewire the update handler. */
+  private rebuildYDoc(entry: DocEntry, docId: string, serverData: Uint8Array): void {
     const oldHandler = this.updateHandlers.get(docId)
     if (oldHandler) entry.yDoc.off("update", oldHandler)
     entry.yDoc.destroy()
 
     const freshDoc = new Y.Doc()
-    Y.applyUpdate(freshDoc, latestServerData, "remote")
+    Y.applyUpdate(freshDoc, serverData, "remote")
     entry.yDoc = freshDoc
 
     const handler = (update: Uint8Array, origin: unknown) => {
       if (origin === "remote") return
-      const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-      this.wsManager.sendBinary(frame)
+      this.wsManager.sendBinary(buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update))
     }
     this.updateHandlers.set(docId, handler)
     freshDoc.on("update", handler)
-
-    // Apply the user's resolution as TARGETED operations (not delete-all + insert).
-    // By only touching the changed region (common-prefix / common-suffix diff), we allow
-    // Yjs to CRDT-merge concurrent edits to non-overlapping parts of the document on the
-    // server — preventing a full overwrite of another user's simultaneous changes.
-    const yText = freshDoc.getText("content")
-    const baseText = yText.toString()  // = latestServerText
-
-    if (baseText !== finalText) {
-      // Find the common prefix and suffix to narrow the edit to the changed middle only.
-      let prefixLen = 0
-      const minLen = Math.min(baseText.length, finalText.length)
-      while (prefixLen < minLen && baseText[prefixLen] === finalText[prefixLen]) prefixLen++
-
-      let suffixLen = 0
-      const maxSuffix = minLen - prefixLen
-      while (
-        suffixLen < maxSuffix &&
-        baseText[baseText.length - 1 - suffixLen] === finalText[finalText.length - 1 - suffixLen]
-      ) suffixLen++
-
-      const deleteStart = prefixLen
-      const deleteLen   = baseText.length  - prefixLen - suffixLen
-      const insertText  = suffixLen > 0 ? finalText.slice(prefixLen, finalText.length - suffixLen) : finalText.slice(prefixLen)
-
-      freshDoc.transact(() => {
-        if (deleteLen > 0) yText.delete(deleteStart, deleteLen)
-        if (insertText.length > 0) yText.insert(deleteStart, insertText)
-      })
-    }
-
-    // Drain any frames that were buffered during the conflict tail window
-    // (between conflictServerDoc destroy and pendingConflict clear). Must happen
-    // BEFORE clearing the flag — otherwise a concurrent handleBinaryFrame could
-    // mistake the doc for "normal mode" and step on the drain. Today the drain
-    // is almost always empty (the window is zero ticks in sync code), but it
-    // means future async refactors can't silently drop updates.
-    if (entry.conflictBufferedFrames && entry.conflictBufferedFrames.length > 0) {
-      for (const bufferedData of entry.conflictBufferedFrames) {
-        try {
-          Y.applyUpdate(entry.yDoc, bufferedData, "remote")
-        } catch (err) {
-          log.appendLine(`[yjsBridge] buffered frame replay error: ${err}`)
-        }
-      }
-      log.appendLine(`[yjsBridge] drained ${entry.conflictBufferedFrames.length} buffered conflict-tail frame(s) for ${path.basename(entry.filePath)}`)
-      entry.conflictBufferedFrames = null
-      this.applyDocToEditor(entry)
-    }
-
-    // Resolution is complete. Clear the gate so normal incremental updates resume.
-    // Any concurrent server changes will arrive as WS_BINARY_YJS_UPDATE frames and
-    // be applied normally — no re-subscribe needed (and it would race against the
-    // fire-and-forget persistUpdate on the server, causing a spurious new conflict).
-    entry.pendingConflict = false
-    entry.hasReceivedState = true
-    log.appendLine(`[yjsBridge] applied final text for ${path.basename(entry.filePath)}: ${finalText.length} chars`)
   }
 
   /** Replace local Y.Doc with the raw server Yjs state (error / dismiss fallback). */
   private applyServerState(entry: DocEntry, docId: string, serverStateData: Uint8Array): void {
-    const oldHandler = this.updateHandlers.get(docId)
-    if (oldHandler) entry.yDoc.off("update", oldHandler)
-    entry.yDoc.destroy()
-
-    const freshDoc = new Y.Doc()
-    Y.applyUpdate(freshDoc, serverStateData, "remote")
-    entry.yDoc = freshDoc
-
-    const handler = (update: Uint8Array, origin: unknown) => {
-      if (origin === "remote") return
-      const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-      this.wsManager.sendBinary(frame)
-    }
-    this.updateHandlers.set(docId, handler)
-    freshDoc.on("update", handler)
-
+    this.rebuildYDoc(entry, docId, serverStateData)
     entry.hasReceivedState = true
     log.appendLine(`[yjsBridge] applied server state for ${path.basename(entry.filePath)}`)
     this.applyDocToEditor(entry)
@@ -985,6 +1010,8 @@ export class YjsBridge {
    */
   private offerBackgroundConflictResolution(bgEntry: BackgroundEntry, docId: string, savedLocal: string, remoteText: string): void {
     const fileName = path.basename(bgEntry.filePath)
+    // E3: Gate incoming updates while the conflict dialog/resolution is pending
+    bgEntry.pendingConflict = true
 
     vscode.window.showWarningMessage(
       `Shynkro: "${fileName}" has a sync conflict (modified offline and on server).`,
@@ -992,23 +1019,35 @@ export class YjsBridge {
       "Keep Remote"
     ).then((choice) => {
       if (choice === "Keep Remote") {
-        // Remote already applied to disk — nothing to do
+        bgEntry.pendingConflict = false
         return
       }
       if (choice === "Open to Resolve") {
+        // M3: Capture the bgEntry reference — if the doc was promoted to foreground
+        // while the dialog was open, skip the stale callback.
+        const capturedBgEntry = bgEntry
         Promise.resolve(
-          vscode.workspace.openTextDocument(bgEntry.filePath)
+          vscode.workspace.openTextDocument(capturedBgEntry.filePath)
         ).then((doc) => vscode.window.showTextDocument(doc))
           .then((editor) => {
-            this.conflictManager.startConflict(docId, editor, savedLocal, remoteText, (finalText) => {
-              const yText = bgEntry.yDoc.getText("content")
-              bgEntry.yDoc.transact(() => {
+            this.conflictManager.startConflict(docId, editor, savedLocal, remoteText, capturedBgEntry.baseText ?? "", (finalText) => {
+              // M3: Check if this background entry is still active
+              if (!this.backgroundDocs.has(docId)) {
+                log.appendLine(`[yjsBridge] background conflict resolved but doc was promoted — skipping`)
+                return
+              }
+              const yText = capturedBgEntry.yDoc.getText("content")
+              capturedBgEntry.yDoc.transact(() => {
                 if (yText.length > 0) yText.delete(0, yText.length)
                 if (finalText.length > 0) yText.insert(0, finalText)
               })
-              this.scheduleBackgroundWrite(docId, bgEntry)
-            }).catch(() => {})
-          }).catch(() => {})
+              capturedBgEntry.pendingConflict = false
+              this.scheduleBackgroundWrite(docId, capturedBgEntry)
+            }).catch(() => { capturedBgEntry.pendingConflict = false })
+          }).catch(() => { capturedBgEntry.pendingConflict = false })
+      } else {
+        // Dialog dismissed without choice
+        bgEntry.pendingConflict = false
       }
     })
   }
@@ -1073,21 +1112,65 @@ export class YjsBridge {
       return
     }
 
-    // Use WorkspaceEdit — works even if the TextEditor object is stale
+    // Incremental edit: compute the minimal changed region so decorations
+    // (remote cursor labels, selection highlights) outside the edit range are
+    // preserved. A full-document replace would invalidate ALL decorations and
+    // cause cursor labels to briefly flash at the end of the file.
+    const currentText = doc.getText()
+    let prefixLen = 0
+    const minLen = Math.min(currentText.length, editorText.length)
+    while (prefixLen < minLen && currentText[prefixLen] === editorText[prefixLen]) prefixLen++
+    let suffixLen = 0
+    const maxSuffix = minLen - prefixLen
+    while (
+      suffixLen < maxSuffix &&
+      currentText[currentText.length - 1 - suffixLen] === editorText[editorText.length - 1 - suffixLen]
+    ) suffixLen++
+
+    const replaceStart = doc.positionAt(prefixLen)
+    const replaceEnd = doc.positionAt(currentText.length - suffixLen)
+    const insertText = editorText.slice(prefixLen, suffixLen > 0 ? editorText.length - suffixLen : undefined)
+
+    // E1: try/finally ensures applyingRemote is always decremented, even if applyEdit throws
     entry.applyingRemote++
-    const edit = new vscode.WorkspaceEdit()
-    const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length))
-    edit.replace(doc.uri, fullRange, editorText)
-    const ok = await vscode.workspace.applyEdit(edit)
-    entry.applyingRemote--
+    let ok: boolean
+    try {
+      const edit = new vscode.WorkspaceEdit()
+      edit.replace(doc.uri, new vscode.Range(replaceStart, replaceEnd), insertText)
+      ok = await vscode.workspace.applyEdit(edit)
+    } catch (err) {
+      log.appendLine(`[yjsBridge] applyDocToEditor threw for ${path.basename(entry.filePath)}: ${err}`)
+      ok = false
+    } finally {
+      entry.applyingRemote--
+    }
     if (ok) {
       onSuccess?.()
+      this.drainPendingCursor(entry)
     } else if (retries > 0) {
       setTimeout(() => this.applyDocToEditor(entry, retries - 1, onSuccess), 50)
     } else {
       log.appendLine(`[yjsBridge] applyDocToEditor failed after retries for ${path.basename(entry.filePath)}`)
       onSuccess?.()
+      this.drainPendingCursor(entry)
     }
+  }
+
+  private drainPendingCursor(entry: DocEntry): void {
+    const cursor = entry.pendingCursor
+    if (!cursor) return
+    entry.pendingCursor = null
+    const docId = this.findDocIdForEntry(entry)
+    if (docId && cursor.userId !== this.wsManager.userId) {
+      this.applyRemoteCursor(docId, entry, cursor)
+    }
+  }
+
+  private findDocIdForEntry(entry: DocEntry): string | null {
+    for (const [docId, e] of this.docs) {
+      if (e === entry) return docId
+    }
+    return null
   }
 
   private handleDocClose(doc: vscode.TextDocument): void {
@@ -1106,6 +1189,9 @@ export class YjsBridge {
         entry.conflictOriginalServerText = null
         // Keep pendingConflict true on the background entry so incoming Yjs updates stay blocked
       }
+      // E6: Clean up the update handler so background docs don't duplicate WS frames
+      const handler = this.updateHandlers.get(docId)
+      if (handler) { entry.yDoc.off("update", handler); this.updateHandlers.delete(docId) }
       // Demote to background — keep the Y.Doc state, continue receiving updates
       this.docs.delete(docId)
       this.backgroundDocs.set(docId, {
@@ -1115,6 +1201,7 @@ export class YjsBridge {
         writeTimer: null,
         hasReceivedState: entry.hasReceivedState,
         pendingConflict: entry.pendingConflict,
+        baseText: entry.baseText,
       })
       log.appendLine(`[yjsBridge] editor closed, demoted to background: ${path.basename(entry.filePath)}`)
       return

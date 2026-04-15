@@ -100,13 +100,20 @@ export const memberRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/members
       if (!target) return status(404, { message: "Member not found" })
       if (target.role === "owner") return status(400, { message: "Cannot change owner role" })
 
-      await db
-        .update(workspaceMembers)
-        .set({ role: body.role })
-        .where(and(eq(workspaceMembers.workspaceId, params.id), eq(workspaceMembers.userId, params.userId)))
-
-      // Update in-memory role so presence icons reflect the change immediately
+      // S1: Update in-memory role BEFORE DB write to close the race window
+      // where a demoted user's Yjs frames pass the ctx.role check. Revert on
+      // DB failure so the in-memory state doesn't drift.
+      const previousRole = target.role as "editor" | "viewer"
       updateClientRole(params.id, params.userId, body.role)
+      try {
+        await db
+          .update(workspaceMembers)
+          .set({ role: body.role })
+          .where(and(eq(workspaceMembers.workspaceId, params.id), eq(workspaceMembers.userId, params.userId)))
+      } catch (err) {
+        updateClientRole(params.id, params.userId, previousRole)
+        throw err
+      }
 
       // Notify the affected member of their new role
       sendToUser(params.id, params.userId, {

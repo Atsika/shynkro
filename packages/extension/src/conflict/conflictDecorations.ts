@@ -3,20 +3,20 @@ import type { ConflictHunkMeta } from "./diffUtils"
 
 /**
  * Manages TextEditorDecorationType instances for inline diff highlighting.
- * Green background for local (mine) lines, red for server (theirs), thin border for separator.
+ * Teal background for local (mine) lines, purple for server (theirs).
  */
 export class ConflictDecorations implements vscode.Disposable {
   private readonly localDeco = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(35, 134, 54, 0.3)",
+    backgroundColor: "rgba(0, 160, 80, 0.25)",
     isWholeLine: true,
-    overviewRulerColor: "rgba(35, 134, 54, 0.6)",
+    overviewRulerColor: "rgba(0, 190, 100, 0.6)",
     overviewRulerLane: vscode.OverviewRulerLane.Left,
   })
 
   private readonly serverDeco = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(218, 54, 51, 0.3)",
+    backgroundColor: "rgba(30, 120, 220, 0.25)",
     isWholeLine: true,
-    overviewRulerColor: "rgba(218, 54, 51, 0.6)",
+    overviewRulerColor: "rgba(50, 140, 240, 0.6)",
     overviewRulerLane: vscode.OverviewRulerLane.Left,
   })
 

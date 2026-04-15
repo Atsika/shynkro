@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite"
 import type { FileMapRow } from "../types"
 
 const SCHEMA_VERSION = 5
+const FILE_MAP_COLS = "file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode"
 
 export class StateDb {
   private db: DatabaseSync
@@ -99,7 +100,12 @@ export class StateDb {
     this.db.exec(`PRAGMA user_version = ${version};`)
   }
 
-  private addColumnIfMissing(table: string, column: string, type: string): void {
+  // M4: Restrict table/column to known literals to prevent accidental SQL injection
+  private addColumnIfMissing(
+    table: "file_map" | "pending_ops" | "pending_yjs_frames",
+    column: string,
+    type: string
+  ): void {
     const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
     if (!cols.some((c) => c.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`)
@@ -125,17 +131,20 @@ export class StateDb {
 
   getFileByPath(filePath: string): FileMapRow | undefined {
     return this.db
-      .prepare(
-        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE path = ? AND deleted = 0"
-      )
+      .prepare(`SELECT ${FILE_MAP_COLS} FROM file_map WHERE path = ? AND deleted = 0`)
+      .get(filePath) as FileMapRow | undefined
+  }
+
+  /** Case-insensitive path lookup for fast local collision pre-check. */
+  getFileByPathCI(filePath: string): FileMapRow | undefined {
+    return this.db
+      .prepare(`SELECT ${FILE_MAP_COLS} FROM file_map WHERE lower(path) = lower(?) AND deleted = 0`)
       .get(filePath) as FileMapRow | undefined
   }
 
   getFileById(fileId: string): FileMapRow | undefined {
     return this.db
-      .prepare(
-        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE file_id = ? AND deleted = 0"
-      )
+      .prepare(`SELECT ${FILE_MAP_COLS} FROM file_map WHERE file_id = ? AND deleted = 0`)
       .get(fileId) as FileMapRow | undefined
   }
 
@@ -224,9 +233,7 @@ export class StateDb {
 
   allFiles(): FileMapRow[] {
     return this.db
-      .prepare(
-        "SELECT file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, eol_style as eolStyle, has_bom as hasBom, mode FROM file_map WHERE deleted = 0"
-      )
+      .prepare(`SELECT ${FILE_MAP_COLS} FROM file_map WHERE deleted = 0`)
       .all() as unknown as FileMapRow[]
   }
 

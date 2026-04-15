@@ -17,6 +17,19 @@ export class FileWatcher {
   private readonly writeTags = new Set<string>()
   private readonly disposables: vscode.Disposable[] = []
   private readonly ignoreMatcher: (relPath: string) => boolean
+  /**
+   * Pending deletes, debounced by 150 ms. When VS Code "replaces" a file
+   * (drag-and-drop with overwrite, or copy-paste replace), it fires
+   * `onDidDelete` then `onDidCreate` in rapid succession. Without
+   * debouncing, the delete races the create: the server removes the file
+   * before the create arrives, and the user's replacement file vanishes.
+   *
+   * The debounce gives `handleCreate` 150 ms to cancel a pending delete
+   * for the same path. If a create fires within that window, the delete is
+   * cancelled and the create is treated as a content update on the existing
+   * file entry instead.
+   */
+  private readonly pendingDeletes = new Map<string, { timer: ReturnType<typeof setTimeout>; fileId: string; relPath: string }>()
 
   constructor(
     private readonly workspaceRoot: string,
@@ -136,9 +149,59 @@ export class FileWatcher {
 
   private async handleCreate(uri: vscode.Uri): Promise<void> {
     if (this.shouldIgnore(uri)) return
+    // Write-tag check: a rename handler (or reconciler) already wrote this
+    // path — consuming the tag prevents a spurious re-create. This also fixes
+    // the rename-to-different-case race where handleCreate fires before
+    // handleRename finishes updating stateDb, which would otherwise hit the
+    // case-collision check against the not-yet-renamed old entry.
+    if (this.writeTags.has(uri.fsPath)) {
+      this.writeTags.delete(uri.fsPath)
+      return
+    }
     const relPath = path.relative(this.workspaceRoot, uri.fsPath).replace(/\\/g, "/")
+
+    // If there is a pending debounced delete for this exact path, this is a
+    // file-replace (drag-and-drop overwrite, copy-paste replace). Cancel the
+    // delete and route through the change handler so the existing file entry
+    // gets its content updated instead of being deleted and re-created.
+    const pendingDel = this.pendingDeletes.get(uri.fsPath)
+    if (pendingDel) {
+      clearTimeout(pendingDel.timer)
+      this.pendingDeletes.delete(uri.fsPath)
+      log.appendLine(`[watcher] file-replace detected for ${relPath} — routing as change`)
+      // Small delay to ensure the replacement file is fully flushed to disk
+      // before we read it. VS Code fires onDidCreate as soon as the inode
+      // exists, which can be before the content is fully written.
+      setTimeout(() => {
+        this.handleChange(uri).catch((err) =>
+          log.appendLine(`[watcher] file-replace change error for ${relPath}: ${err}`)
+        )
+      }, 100)
+      return
+    }
+
     // Skip files already known (e.g. from import) — avoids 409 on init
     if (this.stateDb.getFileByPath(relPath)) return
+
+    // Fast local case-insensitive collision check — catches the collision
+    // before the server round-trip. VS Code already wrote the file to disk
+    // by the time onDidCreate fires, so we can't prevent creation. We warn
+    // the user and offer to delete. Not auto-deleting because the user may
+    // have `mv`'d the file (original is gone — deleting would lose data).
+    const ciCollision = this.stateDb.getFileByPathCI(relPath)
+    if (ciCollision && ciCollision.path !== relPath) {
+      log.appendLine(`[watcher] case collision: "${relPath}" vs existing "${ciCollision.path}"`)
+      vscode.window.showWarningMessage(
+        `Shynkro: "${path.basename(relPath)}" won't sync — "${path.basename(ciCollision.path)}" already exists (case-insensitive match). Rename or delete one of them.`,
+        "Delete Local Copy",
+        "Dismiss"
+      ).then((choice) => {
+        if (choice === "Delete Local Copy") {
+          try { fs.rmSync(uri.fsPath, { force: true }) } catch {}
+        }
+      })
+      return
+    }
     let stat: fs.Stats
     try {
       // lstat (not stat) so we don't follow symlinks — symlinks are skipped below.
@@ -225,9 +288,17 @@ export class FileWatcher {
     } catch (err) {
       log.appendLine(`[watcher] handleCreate error for ${relPath}: ${err}`)
       if (err instanceof ApiError && err.code === "PATH_CASE_COLLISION") {
+        // Server-side fallback (race: another client created the collision
+        // between our local check and the server call).
         vscode.window.showWarningMessage(
-          `Shynkro: cannot create "${relPath}" — ${err.message}`
-        )
+          `Shynkro: "${path.basename(relPath)}" won't sync — a file with the same name (different case) already exists in this workspace. Rename or delete one of them.`,
+          "Delete Local Copy",
+          "Dismiss"
+        ).then((choice) => {
+          if (choice === "Delete Local Copy") {
+            try { fs.rmSync(uri.fsPath, { force: true }) } catch {}
+          }
+        })
       }
     }
   }
@@ -235,7 +306,7 @@ export class FileWatcher {
   private readonly _onTextFileRegistered = new vscode.EventEmitter<string>()
   readonly onTextFileRegistered = this._onTextFileRegistered.event
 
-  private async handleChange(uri: vscode.Uri): Promise<void> {
+  async handleChange(uri: vscode.Uri): Promise<void> {
     if (this.shouldIgnore(uri)) return
     if (this.writeTags.has(uri.fsPath)) {
       this.writeTags.delete(uri.fsPath)
@@ -243,14 +314,19 @@ export class FileWatcher {
     }
     const relPath = path.relative(this.workspaceRoot, uri.fsPath).replace(/\\/g, "/")
     const row = this.stateDb.getFileByPath(relPath)
-    if (!row) return
+    if (!row) {
+      log.appendLine(`[watcher] handleChange: no stateDb row for ${relPath} — skipping`)
+      return
+    }
 
     if (row.kind === "binary") {
-      // Binary sync is handled by BinarySync via explicit call from changeReconciler
-      // Emit a synthetic event for BinarySync to pick up
+      log.appendLine(`[watcher] handleChange: binary changed ${relPath}`)
       this._onBinaryChanged.fire({ fileId: row.fileId as import("@shynkro/shared").FileId, localPath: uri.fsPath })
     } else if (row.kind === "text" && row.docId) {
+      log.appendLine(`[watcher] handleChange: text changed externally ${relPath}`)
       this._onTextFileChangedExternally.fire({ fileId: row.fileId as import("@shynkro/shared").FileId, docId: row.docId, filePath: uri.fsPath })
+    } else {
+      log.appendLine(`[watcher] handleChange: unhandled kind=${row.kind} docId=${row.docId} for ${relPath}`)
     }
   }
 
@@ -277,27 +353,35 @@ export class FileWatcher {
     const row = this.stateDb.getFileByPath(relPath)
     if (!row) return
 
-    // Soft-delete: marks the row as deleted (tombstone) but keeps it in file_map so that
-    // if the server re-surfaces this file (e.g. after a server restart), applyCreated
-    // will re-delete it rather than restoring it locally.
-    this.stateDb.deleteFile(row.fileId)
+    // Debounce: when VS Code "replaces" a file (drag-and-drop overwrite, copy-paste
+    // replace), it fires onDidDelete then onDidCreate in rapid succession. Without
+    // debouncing, the delete races the create — the server removes the file before
+    // the create arrives and the replacement file vanishes. The 150 ms window gives
+    // handleCreate a chance to cancel the pending delete and treat the whole
+    // operation as a content update on the existing file entry.
+    const existing = this.pendingDeletes.get(uri.fsPath)
+    if (existing) clearTimeout(existing.timer)
 
-    // Signal the Yjs bridge to tear down any in-flight subscription for this
-    // file so the editor can't keep typing into a doc the server no longer
-    // tracks. Local delete → no prompt needed, the user explicitly removed it.
+    const timer = setTimeout(() => {
+      this.pendingDeletes.delete(uri.fsPath)
+      this.executeDelete(uri, row.fileId, relPath)
+    }, 150)
+    this.pendingDeletes.set(uri.fsPath, { timer, fileId: row.fileId, relPath })
+  }
+
+  /** Actually run the delete after the debounce window expires. */
+  private executeDelete(uri: vscode.Uri, fileId: string, relPath: string): void {
+    this.stateDb.deleteFile(fileId)
     this._onFileDeleted.fire({ absPath: uri.fsPath, remote: false })
 
     if (!this.wsManager.connected) {
-      this.stateDb.enqueuePendingOp({ opType: "delete", path: relPath, fileId: row.fileId })
+      this.stateDb.enqueuePendingOp({ opType: "delete", path: relPath, fileId })
       log.appendLine(`[watcher] offline — queued delete ${relPath}`)
       return
     }
 
-    try {
-      await this.restClient.deleteFile(this.workspaceId, row.fileId as import("@shynkro/shared").FileId)
-    } catch (err) {
-      log.appendLine(`[watcher] handleDelete error for ${relPath}: ${err}`)
-    }
+    this.restClient.deleteFile(this.workspaceId, fileId as import("@shynkro/shared").FileId)
+      .catch((err) => log.appendLine(`[watcher] handleDelete error for ${relPath}: ${err}`))
   }
 
   /** Fires when a tracked file is deleted locally or remotely. */
@@ -305,6 +389,9 @@ export class FileWatcher {
   readonly onFileDeleted = this._onFileDeleted.event
 
   dispose(): void {
+    // E5: Cancel all pending delete timers to prevent firing on closed stateDb
+    for (const pending of this.pendingDeletes.values()) clearTimeout(pending.timer)
+    this.pendingDeletes.clear()
     this.watcher?.dispose()
     this.disposables.forEach((d) => d.dispose())
     this._onBinaryChanged.dispose()

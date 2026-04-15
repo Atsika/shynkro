@@ -79,59 +79,66 @@ export class ChunkedDownloader {
     fs.mkdirSync(dir, { recursive: true })
     const tmpPath = path.join(dir, `${SHYNKRO_TMP_PREFIX}${crypto.randomBytes(6).toString("hex")}-${path.basename(targetPath)}`)
 
-    const result = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `Shynkro: downloading ${path.basename(targetPath)}`,
-        cancellable: false,
-      },
-      async (progress) => {
-        const out = fs.createWriteStream(tmpPath)
-        const hasher = crypto.createHash("sha256")
-        let received = 0
-        try {
-          for (let start = 0; start < totalSize; start += DEFAULT_CHUNK_SIZE) {
-            const end = Math.min(start + DEFAULT_CHUNK_SIZE, totalSize) - 1
-            const res = await fetch(url, {
-              headers: { ...headers, Range: `bytes=${start}-${end}` },
-            })
-            if (!res.ok && res.status !== 206) {
-              throw new Error(`chunk ${start}-${end} failed: ${res.status} ${await safeText(res)}`)
-            }
-            // Stream the response body into the file + hasher.
-            const reader = res.body?.getReader()
-            if (!reader) throw new Error("response body has no reader")
-            let chunkLen = 0
-            while (true) {
-              const { value, done } = await reader.read()
-              if (done) break
-              if (!value) continue
-              hasher.update(value)
-              await new Promise<void>((resolve, reject) => {
-                if (!out.write(value)) {
-                  out.once("drain", () => resolve())
-                } else {
-                  resolve()
-                }
-                out.on("error", reject)
+    let result: { received: number; hash: string }
+    try {
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Shynkro: downloading ${path.basename(targetPath)}`,
+          cancellable: false,
+        },
+        async (progress) => {
+          const out = fs.createWriteStream(tmpPath)
+          const hasher = crypto.createHash("sha256")
+          let received = 0
+          try {
+            for (let start = 0; start < totalSize; start += DEFAULT_CHUNK_SIZE) {
+              const end = Math.min(start + DEFAULT_CHUNK_SIZE, totalSize) - 1
+              const res = await fetch(url, {
+                headers: { ...headers, Range: `bytes=${start}-${end}` },
               })
-              chunkLen += value.byteLength
+              if (!res.ok && res.status !== 206) {
+                throw new Error(`chunk ${start}-${end} failed: ${res.status} ${await safeText(res)}`)
+              }
+              const reader = res.body?.getReader()
+              if (!reader) throw new Error("response body has no reader")
+              let chunkLen = 0
+              while (true) {
+                const { value, done } = await reader.read()
+                if (done) break
+                if (!value) continue
+                hasher.update(value)
+                await new Promise<void>((resolve, reject) => {
+                  if (!out.write(value)) {
+                    out.once("drain", () => resolve())
+                  } else {
+                    resolve()
+                  }
+                  out.on("error", reject)
+                })
+                chunkLen += value.byteLength
+              }
+              received += chunkLen
+              const pct = Math.min(100, Math.round((received / totalSize) * 100))
+              progress.report({
+                message: `${formatBytes(received)} / ${formatBytes(totalSize)} (${pct}%)`,
+                increment: (chunkLen / totalSize) * 100,
+              })
             }
-            received += chunkLen
-            const pct = Math.min(100, Math.round((received / totalSize) * 100))
-            progress.report({
-              message: `${formatBytes(received)} / ${formatBytes(totalSize)} (${pct}%)`,
-              increment: (chunkLen / totalSize) * 100,
-            })
+          } finally {
+            await new Promise<void>((resolve, reject) =>
+              out.end((err: Error | null | undefined) => (err ? reject(err) : resolve()))
+            )
           }
-        } finally {
-          await new Promise<void>((resolve, reject) =>
-            out.end((err: Error | null | undefined) => (err ? reject(err) : resolve()))
-          )
+          return { received, hash: hasher.digest("hex") }
         }
-        return { received, hash: hasher.digest("hex") }
-      }
-    )
+      )
+    } catch (err) {
+      // Clean up the temp file on ANY failure — prevents orphaned sidecars
+      // from accumulating on disk across retries.
+      try { fs.unlinkSync(tmpPath) } catch { /* already gone */ }
+      throw err
+    }
 
     if (remoteHash && result.hash !== remoteHash) {
       try { fs.unlinkSync(tmpPath) } catch { /* ignore */ }
