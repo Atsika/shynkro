@@ -10,15 +10,14 @@ export interface WsContext {
   subscribedDocs: Set<string>
   jwtExp: number // Unix timestamp
   awarenessTimeouts: Map<string, ReturnType<typeof setTimeout>>
+  /** S5: timer handles for JWT expiry warning + close, so refreshToken can cancel them. */
+  expiryWarningTimer: ReturnType<typeof setTimeout> | null
+  expiryCloseTimer: ReturnType<typeof setTimeout> | null
 }
 
 // In-memory state for single-instance MVP
 const workspaceClients = new Map<string, Set<WsContext>>()
 const docClients = new Map<string, Set<WsContext>>()
-
-export function registerClient(_ctx: WsContext): void {
-  // Placeholder — subscriptions are registered individually via subscribeToWorkspace/subscribeToDoc
-}
 
 export function unregisterClient(ctx: WsContext): void {
   for (const workspaceId of ctx.subscribedWorkspaces) {
@@ -86,6 +85,32 @@ export function getWorkspacePresence(workspaceId: string) {
   return [...clients].map((c) => ({ userId: c.userId, username: c.username, role: c.role }))
 }
 
+/**
+ * Debounced presence broadcast — ensures all concurrent subscribe/unsubscribe
+ * operations settle before broadcasting the final state. Solves the race where
+ * two clients reconnect simultaneously (e.g. window reload) and each sees only
+ * itself because the other's `subscribeWorkspace` hasn't completed yet.
+ *
+ * Call this instead of manual `broadcastToWorkspace` for presence updates.
+ * The immediate broadcast in `subscribeWorkspace` gives instant feedback to the
+ * subscribing client; this deferred follow-up catches everyone else.
+ */
+const pendingPresenceBroadcasts = new Map<string, ReturnType<typeof setTimeout>>()
+
+export function debouncedPresenceBroadcast(workspaceId: string): void {
+  const existing = pendingPresenceBroadcasts.get(workspaceId)
+  if (existing) clearTimeout(existing)
+
+  pendingPresenceBroadcasts.set(workspaceId, setTimeout(() => {
+    pendingPresenceBroadcasts.delete(workspaceId)
+    broadcastToWorkspace(workspaceId, {
+      type: "presenceUpdate",
+      workspaceId,
+      users: getWorkspacePresence(workspaceId),
+    })
+  }, 500))
+}
+
 export function updateClientRole(workspaceId: string, userId: string, newRole: Role): void {
   const clients = workspaceClients.get(workspaceId)
   if (!clients) return
@@ -105,6 +130,15 @@ export function sendToUser(workspaceId: string, userId: string, message: ServerM
   const payload = JSON.stringify(message)
   for (const ctx of clients) {
     if (ctx.userId === userId) ctx.ws.send(payload)
+  }
+}
+
+/** S7: Force-close all WS connections subscribed to a deleted workspace. */
+export function disconnectWorkspaceClients(workspaceId: string): void {
+  const clients = workspaceClients.get(workspaceId)
+  if (!clients) return
+  for (const ctx of [...clients]) {
+    try { ctx.ws.close(4004, "Workspace deleted") } catch {}
   }
 }
 

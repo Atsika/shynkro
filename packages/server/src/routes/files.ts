@@ -8,8 +8,8 @@ import {
   yjsUpdates,
 } from "../db/schema.js"
 import { withAuth } from "../middleware/auth.js"
-import { broadcastToWorkspace } from "../services/realtimeState.js"
-import { getPlainText, prepareDocUpdate, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
+import { broadcastToWorkspace, broadcastToDoc } from "../services/realtimeState.js"
+import { getPlainText, prepareDocUpdate, forceSetDocContent, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
 import { uuid, isValidFilePath } from "../utils.js"
 import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { requireMember } from "../lib/authz.js"
@@ -213,6 +213,47 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       throw err
     }
   })
+
+  // PUT /api/v1/workspaces/:id/files/:fileId/content
+  // Force-sets the Yjs document to the given text, bypassing CRDT merge.
+  // Used exclusively by conflict resolution to establish the user's chosen text
+  // as the new authoritative server state and broadcast it to all subscribers.
+  .put(
+    "/:fileId/content",
+    async ({ params, body, user }) => {
+      const member = await requireMember(params.id, user.id)
+      if (!member || member.role === "viewer") return status(403, { message: "Forbidden" })
+
+      const [file] = await db
+        .select()
+        .from(fileEntries)
+        .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+        .limit(1)
+
+      if (!file) return status(404, { message: "File not found" })
+      if (file.kind !== "text" || !file.docId) return status(400, { message: "Not a text file" })
+
+      try {
+        const newState = await forceSetDocContent(file.docId, body.text)
+
+        // Broadcast the new canonical state as WS_BINARY_YJS_STATE (frame type 0x02)
+        // so all subscribers replace their Yjs doc with this clean state.
+        const docIdBytes = Buffer.from(file.docId.replace(/-/g, ""), "hex")
+        const frame = new Uint8Array(1 + 16 + newState.length)
+        frame[0] = 0x02  // WS_BINARY_YJS_STATE
+        frame.set(docIdBytes, 1)
+        frame.set(newState, 17)
+        broadcastToDoc(file.docId, frame)
+
+        return { ok: true }
+      } catch (err) {
+        if (err instanceof DocCorruptedError) return status(503, { code: "DOC_CORRUPTED", message: err.message })
+        if (err instanceof DocDeletedError) return status(410, { code: "DOC_DELETED", message: err.message })
+        throw err
+      }
+    },
+    { body: t.Object({ text: t.String() }) }
+  )
 
   // PATCH /api/v1/workspaces/:id/files/:fileId
   .patch(

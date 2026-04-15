@@ -23,6 +23,14 @@ import { atomicWriteFileSync } from "../text/atomicWrite"
 export class ChangeReconciler {
   private pollTimer: NodeJS.Timeout | null = null
   private readonly disposables: vscode.Disposable[] = []
+  /** E4: Guard against concurrent reconcile runs */
+  private reconciling = false
+  /**
+   * Paths that were "untracked" by the local user — the server will broadcast
+   * fileDeleted for these, but we must NOT rm the local file. The set is
+   * consumed (entry removed) when applyDeleted fires for that path.
+   */
+  private readonly untrackedPaths = new Set<string>()
 
   constructor(
     private readonly workspaceId: WorkspaceId,
@@ -33,7 +41,22 @@ export class ChangeReconciler {
     private readonly binarySync: BinarySync
   ) {}
 
+  /**
+   * Mark a path as "untracked locally" so the upcoming fileDeleted broadcast
+   * from the server skips the local `fs.rmSync`. The entry is consumed once.
+   */
+  markUntracked(relPath: string): void {
+    this.untrackedPaths.add(relPath)
+  }
+
   async reconcile(): Promise<void> {
+    // E4: Prevent concurrent reconcile runs from polling + manual overlap
+    if (this.reconciling) return
+    this.reconciling = true
+    try { await this._reconcile() } finally { this.reconciling = false }
+  }
+
+  private async _reconcile(): Promise<void> {
     // Stream the change log in pages so a client reconnecting after a long
     // offline stretch never loads millions of rows in one response. The first
     // page carries `currentRevision` (frozen at fetch time); subsequent pages
@@ -105,7 +128,8 @@ export class ChangeReconciler {
 
   startPolling(): void {
     this.pollTimer = setInterval(() => {
-      this.reconcile().catch(() => {})
+      // M1: Log reconcile errors instead of silently swallowing
+      this.reconcile().catch((err) => log.appendLine(`[reconciler] poll reconcile error: ${err}`))
     }, CHANGE_POLL_INTERVAL_MS)
   }
 
@@ -134,6 +158,7 @@ export class ChangeReconciler {
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind, msg.docId ?? undefined)
       this.stateDb.setRevision(this.workspaceId, msg.revision)
       if (msg.kind === "text" && msg.docId) this._onTextFileRegistered.fire(localPath)
+      this._onFileTracked.fire(localPath)
       return
     }
 
@@ -173,6 +198,7 @@ export class ChangeReconciler {
         this.stateDb.setRevision(this.workspaceId, msg.revision)
         log.appendLine(`[reconciler] created ${msg.path}`)
         this._onTextFileRegistered.fire(localPath)
+        this._onFileTracked.fire(localPath)
       } catch (err) {
         log.appendLine(`[reconciler] applyCreated error for ${msg.path}: ${err}`)
       }
@@ -186,6 +212,7 @@ export class ChangeReconciler {
         this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
       }
       this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this._onFileTracked.fire(localPath)
       try {
         await this.binarySync.download(msg.fileId, localPath, this.workspaceId)
       } catch (err) {
@@ -196,6 +223,7 @@ export class ChangeReconciler {
       fs.mkdirSync(localPath, { recursive: true })
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind)
       this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this._onFileTracked.fire(localPath)
     }
   }
 
@@ -218,6 +246,8 @@ export class ChangeReconciler {
       // stateDb.renameFile is idempotent — safe to call whether or not we just moved.
       this.stateDb.renameFile(msg.fileId, msg.path)
       this.stateDb.setRevision(this.workspaceId, msg.revision)
+      this._onFileTracked.fire(newLocal)
+      this._onFileTracked.fire(oldLocal)
     } catch (err) {
       log.appendLine(`[reconciler] applyRenamed error: ${err}`)
     }
@@ -226,17 +256,31 @@ export class ChangeReconciler {
   private async applyDeleted(msg: FileDeletedMessage): Promise<void> {
     const localPath = safeJoin(this.workspaceRoot, msg.path)
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${msg.path}`); return }
+
+    // If this path was "untracked" by the local user, the server broadcast
+    // is the echo of our own delete-from-workspace call. Skip the local rm
+    // so the user's file stays on disk as promised.
+    const isUntrack = this.untrackedPaths.has(msg.path)
+    if (isUntrack) {
+      this.untrackedPaths.delete(msg.path)
+      log.appendLine(`[reconciler] applyDeleted: skipping local rm for untracked path ${msg.path}`)
+    }
+
     this.fileWatcher.addWriteTag(localPath)
     // Signal the Yjs bridge so any open editor for this file gets torn down
     // (closes the tab, prompts for recovery if dirty, unsubscribes the doc).
     // Fire before removing the file so the bridge's lookup by path still works.
     this._onRemoteFileDeleted.fire({ absPath: localPath })
-    try {
-      // rmSync handles files, directories (recursive), and is a no-op when force:true + path missing
-      fs.rmSync(localPath, { recursive: true, force: true })
-    } catch (err) {
-      log.appendLine(`[reconciler] applyDeleted error for ${msg.path}: ${err}`)
+
+    if (!isUntrack) {
+      try {
+        // rmSync handles files, directories (recursive), and is a no-op when force:true + path missing
+        fs.rmSync(localPath, { recursive: true, force: true })
+      } catch (err) {
+        log.appendLine(`[reconciler] applyDeleted error for ${msg.path}: ${err}`)
+      }
     }
+
     // Hard-delete: server has confirmed the deletion, so the tombstone is no longer needed.
     this.stateDb.purgeFile(msg.fileId)
     this.stateDb.setRevision(this.workspaceId, msg.revision)
@@ -284,11 +328,15 @@ export class ChangeReconciler {
         )
         if (choice === "Keep Local") {
           await this.binarySync.upload(msg.fileId as FileId, localPath, this.workspaceId)
+          // E8: Persist local hash so the next poll doesn't re-download server version
+          if (localHash) this.stateDb.updateBinaryHash(msg.fileId, localHash)
         } else {
           await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+          this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
         }
       } else {
         await this.binarySync.download(msg.fileId as FileId, localPath, this.workspaceId)
+        this.stateDb.updateBinaryHash(msg.fileId, msg.hash)
       }
 
       this.stateDb.setRevision(this.workspaceId, msg.revision)
@@ -300,10 +348,15 @@ export class ChangeReconciler {
   private readonly _onTextFileRegistered = new vscode.EventEmitter<string>()
   readonly onTextFileRegistered = this._onTextFileRegistered.event
 
+  /** Fires when any file (text, binary, or folder) is added to stateDb by the reconciler. */
+  private readonly _onFileTracked = new vscode.EventEmitter<string>()
+  readonly onFileTracked = this._onFileTracked.event
+
   dispose(): void {
     this.stopPolling()
     this.disposables.forEach((d) => d.dispose())
     this._onTextFileRegistered.dispose()
+    this._onFileTracked.dispose()
     this._onRemoteFileDeleted.dispose()
   }
 }

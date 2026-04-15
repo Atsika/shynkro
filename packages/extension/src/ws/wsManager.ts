@@ -27,6 +27,7 @@ export class WsManager {
   private pingTimer: NodeJS.Timeout | null = null
   private pongTimer: NodeJS.Timeout | null = null
   private disposed = false
+  private loggedOutNotified = false
 
   private serverUrl = ""
   private workspaceId: WorkspaceId = "" as WorkspaceId
@@ -66,14 +67,34 @@ export class WsManager {
     this.closeCurrentWs()
 
     const wsUrl = this.serverUrl.replace(/^http/, "ws") + "/api/v1/realtime"
+    log.appendLine(`[ws] connecting (attempt ${this.reconnectAttempt + 1}) → ${wsUrl}`)
     this._onStatusChange.fire("connecting")
     this.statusBar.setStatus("connecting")
 
     const token = await this.authService.getValidAccessToken(this.serverUrl).catch(() => undefined)
     if (!token) {
+      this._onStatusChange.fire("disconnected")
+      this.statusBar.setStatus("disconnected")
+      // getValidAccessToken returns undefined (no throw) only when there are no
+      // stored credentials. In that case the user must log in — keep looping
+      // would be pointless and the status bar would spin forever.
+      const hasCredentials = await this.authService.hasCredentials(this.serverUrl)
+      if (!hasCredentials) {
+        log.appendLine("[ws] no credentials — stopping reconnect loop")
+        if (!this.loggedOutNotified) {
+          this.loggedOutNotified = true
+          vscode.window.showWarningMessage(
+            "Shynkro: session expired or not logged in. Please log in to resume syncing.",
+            "Log In"
+          ).then((choice) => { if (choice === "Log In") vscode.commands.executeCommand("shynkro.login") })
+        }
+        return // Do not schedule reconnect — startSync/connect() will restart when user logs in
+      }
+      // Server is temporarily unreachable (token refresh timed out) — keep retrying.
       this.scheduleReconnect()
       return
     }
+    this.loggedOutNotified = false // Reset so future logged-out events notify again
 
     const ws = new WebSocket(wsUrl)
     ws.binaryType = "arraybuffer"
@@ -96,18 +117,25 @@ export class WsManager {
         this.handleBinary(Buffer.from(event.data))
       } else {
         try {
-          const msg = JSON.parse(event.data as string) as ServerMessage
-          this.handleServerMessage(msg)
+          const parsed = JSON.parse(event.data as string)
+          // P3: Basic shape validation before casting — reject non-objects and missing type
+          if (typeof parsed !== "object" || parsed === null || typeof parsed.type !== "string") {
+            log.appendLine(`[ws] malformed server message — missing type field`)
+            return
+          }
+          this.handleServerMessage(parsed as ServerMessage)
         } catch (err) {
           log.appendLine(`[ws] Failed to parse server message: ${err}`)
         }
       }
     })
 
-    ws.addEventListener("close", () => {
+    ws.addEventListener("close", (event) => {
       if (this.ws !== ws) return // stale connection — ignore
       this.clearTimers()
       if (this.disposed) return
+      const code = (event as { code?: number }).code ?? "?"
+      log.appendLine(`[ws] closed (code=${code})`)
       this._onStatusChange.fire("disconnected")
       this.statusBar.setStatus("disconnected")
       this.scheduleReconnect()
@@ -115,6 +143,16 @@ export class WsManager {
 
     ws.addEventListener("error", () => {
       log.appendLine(`[ws] connection error`)
+      if (this.ws !== ws || this.disposed) return
+      // Null this.ws before scheduling so that if Node.js also fires a close
+      // event for the same socket (some versions do), the close handler sees a
+      // stale connection and returns early — preventing a double scheduleReconnect
+      // which would double-increment the backoff and make retries feel stuck.
+      this.ws = null
+      this.clearTimers()
+      this._onStatusChange.fire("disconnected")
+      this.statusBar.setStatus("disconnected")
+      this.scheduleReconnect()
     })
   }
 
@@ -122,14 +160,14 @@ export class WsManager {
     if (msg.type === "welcome") {
       this.userId = msg.userId
       this.sendJson({ type: "subscribeWorkspace", workspaceId: this.workspaceId })
-      this._onStatusChange.fire("connected")
-      this.statusBar.setStatus("connected")
-      this.startPing()
-      // Flush any Yjs updates that were buffered while disconnected. Persisted
-      // frames survive extension reloads — replay is idempotent because Yjs
-      // updates are CRDT-merged server-side, so re-sending an already-applied
-      // update is safe. Each frame is deleted from the queue only after ws.send
-      // returns without throwing, so a reload mid-flush still has the tail.
+      // Flush persisted offline Yjs frames BEFORE firing "connected".
+      // "connected" causes yjsBridge to send subscribeDoc for each open editor,
+      // which makes the server send back the current doc state. If we flushed
+      // AFTER that, the server would send the pre-flush state and the client
+      // would detect a spurious conflict even though the edits would CRDT-merge
+      // cleanly. By flushing first, the WS send buffer order is:
+      //   subscribeWorkspace → offline frames → subscribeDoc
+      // so the server applies the offline edits before computing the state to send.
       if (this.stateDb) {
         const rows = this.stateDb.allPendingYjsFrames()
         if (rows.length > 0) {
@@ -146,6 +184,9 @@ export class WsManager {
           }
         }
       }
+      this._onStatusChange.fire("connected")
+      this.statusBar.setStatus("connected")
+      this.startPing()
     } else if (msg.type === "pong") {
       if (this.pongTimer) {
         clearTimeout(this.pongTimer)
@@ -156,13 +197,22 @@ export class WsManager {
         if (t) this.sendJson({ type: "refreshToken", token: t })
       }).catch(() => {})
     } else if (msg.type === "error") {
-      vscode.window.showErrorMessage(`Shynkro WS error: ${msg.message}`)
+      // Suppress transient protocol errors that are not actionable by the user.
+      // FORBIDDEN/NOT_AUTHENTICATED/DOC_DELETED are handled by higher-level code;
+      // surface only errors that require the user to take action.
+      const suppress = new Set(["FORBIDDEN", "NOT_AUTHENTICATED", "DOC_DELETED", "DOC_CORRUPTED"])
+      if (!suppress.has((msg as { code?: string }).code ?? "")) {
+        vscode.window.showErrorMessage(`Shynkro WS error: ${msg.message}`)
+      } else {
+        log.appendLine(`[ws] server error (suppressed): ${(msg as { code?: string }).code} — ${msg.message}`)
+      }
     }
     this._onServerMessage.fire(msg)
   }
 
   private handleBinary(buf: Buffer): void {
-    if (buf.length < 17) return
+    // P1: Match server's minimum of 18 bytes (1 type + 16 docId + 1 data)
+    if (buf.length < 18) return
     const frameType = buf[0]
     const h = buf.slice(1, 17).toString("hex")
     const docId = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`
@@ -209,10 +259,15 @@ export class WsManager {
     this.clearTimers()
     this.pingTimer = setInterval(() => {
       this.sendJson({ type: "ping" })
-      this.pongTimer = setTimeout(() => {
-        log.appendLine("[ws] pong timeout — terminating connection")
-        this.ws?.close()
-      }, PONG_TIMEOUT_MS)
+      // P2: Only start a pong timer if one isn't already running — prevents
+      // ghost timers from accumulating if pong is slow.
+      if (!this.pongTimer) {
+        this.pongTimer = setTimeout(() => {
+          this.pongTimer = null
+          log.appendLine("[ws] pong timeout — terminating connection")
+          this.ws?.close()
+        }, PONG_TIMEOUT_MS)
+      }
     }, PING_INTERVAL_MS)
   }
 
@@ -222,6 +277,7 @@ export class WsManager {
     const jitter = Math.random() * 500
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS) + jitter
     this.reconnectAttempt++
+    log.appendLine(`[ws] reconnect in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt})`)
     this.reconnectTimer = setTimeout(() => this.doConnect(), delay)
   }
 
@@ -243,6 +299,19 @@ export class WsManager {
   disconnect(): void {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     this.closeCurrentWs()
+  }
+
+  /**
+   * Close the current WS connection without preventing the close handler from
+   * scheduling a reconnect. Used when the server signals graceful shutdown:
+   * we close our end cleanly (so the server drain sees the count drop) while
+   * the reconnect loop stays active and picks up the server when it restarts.
+   */
+  closeForReconnect(): void {
+    this.clearTimers()
+    if (this.ws) this.ws.close()
+    // Deliberately do NOT null this.ws — the close event fires normally and
+    // scheduleReconnect() is called by the existing close handler.
   }
 
   dispose(): void {

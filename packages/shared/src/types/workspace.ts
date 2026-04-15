@@ -73,6 +73,9 @@ export interface WorkspaceChange {
   kind?: FileKind
   hash?: string
   size?: number
+  docId?: DocId
+  /** P4: Matches FileEntry.mode — null on Windows or for unknown files. */
+  mode?: number | null
 }
 
 export interface SnapshotFile {

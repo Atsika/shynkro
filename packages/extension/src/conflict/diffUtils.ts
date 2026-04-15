@@ -89,6 +89,128 @@ export function buildConflictText(localText: string, serverText: string): Confli
   return { text: out.join("\n"), hunks: meta }
 }
 
+/**
+ * Three-way merge: base → local (local changes), base → server (server changes).
+ *
+ * Auto-merges non-conflicting changes (only one side changed a region).
+ * Produces conflict hunks only where BOTH sides changed the same base region
+ * to different values.
+ *
+ * Falls back to `buildConflictText` (2-way) when base is empty or the text is
+ * too large for LCS.
+ */
+export function buildConflictText3way(
+  baseText: string,
+  localText: string,
+  serverText: string,
+): ConflictBuildResult {
+  if (localText === serverText) return { text: localText, hunks: [] }
+  if (!baseText) return buildConflictText(localText, serverText)
+
+  const base = baseText.split("\n")
+  const aLines = localText.split("\n")
+  const bLines = serverText.split("\n")
+
+  if (
+    base.length > MAX_LINES_FOR_LCS ||
+    aLines.length > MAX_LINES_FOR_LCS ||
+    bLines.length > MAX_LINES_FOR_LCS
+  ) {
+    return buildConflictText(localText, serverText)
+  }
+
+  // Compute each side's changes relative to base
+  const aHunks = computeLineDiff(base, aLines)   // base → local
+  const bHunks = computeLineDiff(base, bLines)   // base → server
+
+  if (aHunks.length === 0) return { text: serverText, hunks: [] }
+  if (bHunks.length === 0) return { text: localText, hunks: [] }
+
+  // Annotate each change with its side and group overlapping changes
+  type Change = { side: "A" | "B"; baseStart: number; baseEnd: number; newLines: string[] }
+  const changes: Change[] = [
+    ...aHunks.map(h => ({ side: "A" as const, baseStart: h.localStart, baseEnd: h.localEnd, newLines: h.serverLines })),
+    ...bHunks.map(h => ({ side: "B" as const, baseStart: h.localStart, baseEnd: h.localEnd, newLines: h.serverLines })),
+  ].sort((x, y) => x.baseStart - y.baseStart || (x.side < y.side ? -1 : 1))
+
+  const out: string[] = []
+  const meta: ConflictHunkMeta[] = []
+  let hunkIndex = 0
+  let basePos = 0
+  let ci = 0
+
+  while (ci < changes.length) {
+    const c = changes[ci]
+
+    // Unchanged base lines before this group
+    for (let i = basePos; i < c.baseStart; i++) out.push(base[i])
+    basePos = c.baseStart
+
+    // Collect all changes that overlap with each other into one group
+    const group: Change[] = [c]
+    let groupEnd = c.baseEnd
+    ci++
+    while (ci < changes.length && changes[ci].baseStart < groupEnd) {
+      groupEnd = Math.max(groupEnd, changes[ci].baseEnd)
+      group.push(changes[ci])
+      ci++
+    }
+
+    const hasA = group.some(g => g.side === "A")
+    const hasB = group.some(g => g.side === "B")
+
+    // Apply one side's changes to base[basePos..groupEnd] to get a "view"
+    const applyChanges = (side: "A" | "B"): string[] => {
+      const view: string[] = []
+      let pos = basePos
+      for (const g of group) {
+        if (g.side !== side) continue
+        for (let i = pos; i < g.baseStart; i++) view.push(base[i])
+        for (const l of g.newLines) view.push(l)
+        pos = g.baseEnd
+      }
+      for (let i = pos; i < groupEnd; i++) view.push(base[i])
+      return view
+    }
+
+    if (hasA && !hasB) {
+      // Only local changed — auto-merge
+      for (const l of applyChanges("A")) out.push(l)
+    } else if (hasB && !hasA) {
+      // Only server changed — auto-merge
+      for (const l of applyChanges("B")) out.push(l)
+    } else {
+      // Both sides changed this region — genuine conflict
+      const aView = applyChanges("A")
+      const bView = applyChanges("B")
+
+      if (aView.join("\n") === bView.join("\n")) {
+        // Same result on both sides — auto-merge
+        for (const l of aView) out.push(l)
+      } else {
+        const localStart = out.length
+        for (const l of aView) out.push(l)
+        const localEnd = out.length
+        const serverStart = out.length
+        for (const l of bView) out.push(l)
+        const serverEnd = out.length
+        meta.push({
+          hunkIndex: hunkIndex++,
+          localRange: { start: localStart, end: localEnd },
+          serverRange: { start: serverStart, end: serverEnd },
+        })
+      }
+    }
+
+    basePos = groupEnd
+  }
+
+  // Remaining unchanged base lines
+  for (let i = basePos; i < base.length; i++) out.push(base[i])
+
+  return { text: out.join("\n"), hunks: meta }
+}
+
 // ---------------------------------------------------------------------------
 // Internal: LCS-based line diff
 // ---------------------------------------------------------------------------

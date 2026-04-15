@@ -8,25 +8,12 @@ import { broadcastToWorkspace } from "../services/realtimeState.js"
 import { requireMember } from "../lib/authz.js"
 import { recordChange } from "../lib/changeLog.js"
 import { logger } from "../lib/logger.js"
+import { envInt } from "../lib/envInt.js"
 
 const storage = createStorageBackend()
 
-/**
- * Maximum bytes accepted for a single blob upload, configurable via
- * SHYNKRO_MAX_BLOB_SIZE. Default 50 GB — generous enough for typical pentest
- * artifacts (zipped scans, pcap files, large screenshots) without being
- * unbounded. Disk-bound after that.
- */
-const MAX_BLOB_BYTES = (() => {
-  const raw = process.env.SHYNKRO_MAX_BLOB_SIZE
-  if (!raw) return 50 * 1024 * 1024 * 1024
-  const parsed = parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    logger.warn("SHYNKRO_MAX_BLOB_SIZE is not a positive integer, falling back to default", { raw })
-    return 50 * 1024 * 1024 * 1024
-  }
-  return parsed
-})()
+/** Max blob upload size (default 50 GB). Configurable via SHYNKRO_MAX_BLOB_SIZE. */
+const MAX_BLOB_BYTES = envInt("SHYNKRO_MAX_BLOB_SIZE", 50 * 1024 * 1024 * 1024)
 
 export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fileId" })
   .use(withAuth)
@@ -207,23 +194,33 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
         })
       }
       const length = end - start + 1
-      const slice = blobReader ? blobReader.slice(start, end + 1) : null
-      const body = slice
-        ? slice.stream()
-        : (await storage.get(file.binaryHash)).slice(start, end + 1)
-      return new Response(body as BodyInit, {
+      // Read the requested range into a Buffer. We briefly hold one chunk
+      // (~8 MB) in memory — acceptable for the pentester team scale and avoids
+      // Bun-specific issues with BunFile.slice() as a Response body (which
+      // caused "TypeError: terminated" and hash mismatches on large files).
+      let chunk: Uint8Array
+      if (blobReader) {
+        const slice = blobReader.slice(start, end + 1)
+        chunk = new Uint8Array(await slice.arrayBuffer())
+      } else {
+        chunk = (await storage.get(file.binaryHash)).slice(start, end + 1)
+      }
+      return new Response(Buffer.from(chunk), {
         status: 206,
         headers: {
           ...baseHeaders,
-          "Content-Length": String(length),
+          "Content-Length": String(chunk.byteLength),
           "Content-Range": `bytes ${start}-${end}/${fullSize}`,
         },
       })
     }
 
-    // No Range — full body, but still streamed if we can.
-    const body = blobReader ? blobReader.stream() : (await storage.get(file.binaryHash))
-    return new Response(body as BodyInit, {
+    // No Range — full body. For large files clients should use Range requests;
+    // this path is the fallback for small files and legacy clients.
+    const body: BodyInit = blobReader
+      ? new Uint8Array(await blobReader.arrayBuffer())
+      : Buffer.from(await storage.get(file.binaryHash))
+    return new Response(body, {
       headers: {
         ...baseHeaders,
         "Content-Length": String(fullSize),

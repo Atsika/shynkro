@@ -1,6 +1,6 @@
 import * as path from "path"
 import * as vscode from "vscode"
-import { buildConflictText } from "./diffUtils"
+import { buildConflictText3way } from "./diffUtils"
 import type { ConflictHunkMeta } from "./diffUtils"
 import type { ConflictDecorations } from "./conflictDecorations"
 import type { ConflictLensProvider } from "./conflictLens"
@@ -11,8 +11,8 @@ interface ActiveConflict {
   filePath: string
   localText: string
   serverText: string
+  baseText: string
   hunks: ConflictHunkMeta[]
-  listener: vscode.Disposable
   onResolved: (finalText: string) => void
   /** True while we are writing conflict content — prevents self-triggering. */
   writing: boolean
@@ -22,6 +22,7 @@ interface SuspendedConflict {
   filePath: string
   localText: string
   serverText: string
+  baseText: string
   onResolved: (finalText: string) => void
 }
 
@@ -76,13 +77,15 @@ export class ConflictManager implements vscode.Disposable {
     editor: vscode.TextEditor,
     localText: string,
     serverText: string,
+    baseText: string,
     onResolved: (finalText: string) => void
   ): Promise<void> {
     this.cancelActive(docId)
 
-    const result = buildConflictText(localText, serverText)
+    const result = buildConflictText3way(baseText, localText, serverText)
     if (result.hunks.length === 0) {
-      onResolved(localText)
+      // 3-way merge produced no conflicts — resolve with the merged result
+      onResolved(result.text)
       return
     }
 
@@ -91,8 +94,8 @@ export class ConflictManager implements vscode.Disposable {
       filePath: editor.document.uri.fsPath,
       localText,
       serverText,
+      baseText,
       hunks: result.hunks,
-      listener: null!,
       onResolved,
       writing: true,
     }
@@ -115,12 +118,6 @@ export class ConflictManager implements vscode.Disposable {
 
     // Ensure the document is visible
     await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false })
-
-    // No-op listener kept for future manual edit detection
-    conflict.listener = vscode.workspace.onDidChangeTextDocument((e) => {
-      if (e.document.uri.toString() !== conflict.docUri) return
-      if (conflict.writing) return
-    })
 
     log.appendLine(`[conflictManager] started for docId=${docId} file=${path.basename(editor.document.uri.fsPath)} hunks=${conflict.hunks.length}`)
   }
@@ -152,16 +149,18 @@ export class ConflictManager implements vscode.Disposable {
 
     // Rebuild the interleaved conflict text with updated server content
     conflict.serverText = newServerText
-    const result = buildConflictText(conflict.localText, newServerText)
+    const result = buildConflictText3way(conflict.baseText, conflict.localText, newServerText)
     if (result.hunks.length === 0) {
+      // 3-way merge produced no conflicts — use the merged result directly
+      const merged = result.text
       conflict.writing = true
       const doc = editor.document
       const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length))
       const edit = new vscode.WorkspaceEdit()
-      edit.replace(doc.uri, fullRange, conflict.localText)
+      edit.replace(doc.uri, fullRange, merged)
       await vscode.workspace.applyEdit(edit)
       conflict.writing = false
-      this.finalize(docId, conflict.localText)
+      this.finalize(docId, merged)
       return
     }
 
@@ -271,7 +270,6 @@ export class ConflictManager implements vscode.Disposable {
   suspend(docId: string): void {
     const conflict = this.active.get(docId)
     if (!conflict) return
-    conflict.listener?.dispose()
     const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === conflict.docUri)
     if (editor) this.decorations.clearFromEditor(editor)
     this.lensProvider.removeDoc(conflict.docUri)
@@ -280,6 +278,7 @@ export class ConflictManager implements vscode.Disposable {
       filePath: conflict.filePath,
       localText: conflict.localText,
       serverText: conflict.serverText,
+      baseText: conflict.baseText,
       onResolved: conflict.onResolved,
     })
     this.onCountChange(this.count)
@@ -295,7 +294,7 @@ export class ConflictManager implements vscode.Disposable {
     if (!s) return
     this.suspended.delete(docId)
     log.appendLine(`[conflictManager] resuming docId=${docId}`)
-    await this.startConflict(docId, editor, s.localText, s.serverText, s.onResolved)
+    await this.startConflict(docId, editor, s.localText, s.serverText, s.baseText, s.onResolved)
   }
 
   /** Permanently cancel a conflict (active or suspended) without resolving it. */
@@ -313,16 +312,12 @@ export class ConflictManager implements vscode.Disposable {
   }
 
   private cancelActive(docId: string): void {
-    const conflict = this.active.get(docId)
-    if (!conflict) return
-    conflict.listener?.dispose()
     this.active.delete(docId)
   }
 
   private finalize(docId: string, finalText: string): void {
     const conflict = this.active.get(docId)
     if (!conflict) return
-    conflict.listener.dispose()
     const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === conflict.docUri)
     if (editor) this.decorations.clearFromEditor(editor)
     this.lensProvider.removeDoc(conflict.docUri)
@@ -335,13 +330,13 @@ export class ConflictManager implements vscode.Disposable {
 
   dispose(): void {
     for (const c of this.active.values()) {
-      c.listener?.dispose()
       const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === c.docUri)
       if (editor) this.decorations.clearFromEditor(editor)
       this.lensProvider.removeDoc(c.docUri)
     }
     this.active.clear()
     this.suspended.clear()
+    this.onCountChange(0)
     this._onListChanged.dispose()
   }
 }

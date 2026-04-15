@@ -14,44 +14,14 @@ import { uuid, addMinutes, isValidFilePath } from "../utils.js"
 import { prepareDocUpdate } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { requireMember } from "../lib/authz.js"
-import { logger } from "../lib/logger.js"
+import { envInt } from "../lib/envInt.js"
 
 const storage = createStorageBackend()
 
 const IMPORT_SESSION_TTL_MINUTES = 30
 const MAX_IMPORT_FILES = 5000
-
-/**
- * Per-file size cap for staged import payloads. Anything larger should go through
- * the chunked binary upload path (D1) instead of being base64-stuffed into a JSON
- * body. Default 100 MB; configurable via SHYNKRO_MAX_IMPORT_FILE_SIZE.
- */
-const MAX_IMPORT_FILE_BYTES = (() => {
-  const raw = process.env.SHYNKRO_MAX_IMPORT_FILE_SIZE
-  if (!raw) return 100 * 1024 * 1024
-  const parsed = parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    logger.warn("SHYNKRO_MAX_IMPORT_FILE_SIZE not a positive integer, falling back to default", { raw })
-    return 100 * 1024 * 1024
-  }
-  return parsed
-})()
-
-/**
- * Total cap on the cumulative size of every staged import file in a single
- * session. Bounds the worst-case memory and DB blob TEXT storage for an init.
- * Default 5 GB; configurable via SHYNKRO_MAX_IMPORT_SESSION_SIZE.
- */
-const MAX_IMPORT_SESSION_BYTES = (() => {
-  const raw = process.env.SHYNKRO_MAX_IMPORT_SESSION_SIZE
-  if (!raw) return 5 * 1024 * 1024 * 1024
-  const parsed = parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    logger.warn("SHYNKRO_MAX_IMPORT_SESSION_SIZE not a positive integer, falling back to default", { raw })
-    return 5 * 1024 * 1024 * 1024
-  }
-  return parsed
-})()
+const MAX_IMPORT_FILE_BYTES = envInt("SHYNKRO_MAX_IMPORT_FILE_SIZE", 100 * 1024 * 1024)
+const MAX_IMPORT_SESSION_BYTES = envInt("SHYNKRO_MAX_IMPORT_SESSION_SIZE", 5 * 1024 * 1024 * 1024)
 
 /**
  * Estimate the byte size of a staged import file's payload. Text files are
@@ -189,6 +159,10 @@ export const importRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/import"
 
   // POST /api/v1/workspaces/:id/import/:importId/commit
   .post("/:importId/commit", async ({ params, user }) => {
+    // S4: Re-check membership — user may have been removed between /begin and /commit
+    const member = await requireMember(params.id, user.id)
+    if (!member || member.role === "viewer") return status(403, { message: "Forbidden" })
+
     const [session] = await db
       .select()
       .from(importSessions)

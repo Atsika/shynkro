@@ -206,3 +206,38 @@ export async function encodeDocState(docId: string): Promise<Uint8Array> {
   const doc = await loadDoc(docId)
   return Y.encodeStateAsUpdate(doc)
 }
+
+/**
+ * Atomically replace all Yjs state for a document with a fresh Y.Doc
+ * initialised from `text`. Used by conflict resolution to establish a clean,
+ * authoritative state that bypasses CRDT merge semantics entirely.
+ *
+ * Returns the new state binary so the caller can broadcast it over WebSocket.
+ */
+export async function forceSetDocContent(docId: string, text: string): Promise<Buffer> {
+  const [docRow] = await db
+    .select({ corrupted: collaborativeDocs.corrupted, deletedAt: collaborativeDocs.deletedAt })
+    .from(collaborativeDocs)
+    .where(eq(collaborativeDocs.id, docId))
+    .limit(1)
+
+  if (!docRow) throw new Error(`Doc not found: ${docId}`)
+  if (docRow.corrupted) throw new DocCorruptedError(docId)
+  if (docRow.deletedAt) throw new DocDeletedError(docId)
+
+  const freshDoc = new Y.Doc()
+  if (text.length > 0) freshDoc.getText("content").insert(0, text)
+  const update = Buffer.from(Y.encodeStateAsUpdate(freshDoc))
+  freshDoc.destroy()
+
+  await db.transaction(async (tx) => {
+    // Clear snapshot and all incremental updates, then insert the single authoritative one
+    await tx.update(collaborativeDocs)
+      .set({ snapshot: null, snapshotHash: null, snapshotAt: null, updateCount: 1 })
+      .where(eq(collaborativeDocs.id, docId))
+    await tx.delete(yjsUpdates).where(eq(yjsUpdates.docId, docId))
+    await tx.insert(yjsUpdates).values({ docId, data: update })
+  })
+
+  return update
+}

@@ -183,6 +183,10 @@ export class RestClient {
   getFile(workspaceId: WorkspaceId, fileId: FileId): Promise<FileEntry> {
     return this.request("GET", `/api/v1/workspaces/${workspaceId}/files/${fileId}`)
   }
+  forceSetDocContent(workspaceId: WorkspaceId, fileId: FileId, text: string): Promise<{ ok: boolean }> {
+    return this.request("PUT", `/api/v1/workspaces/${workspaceId}/files/${fileId}/content`, { text })
+  }
+
   async getFileContent(workspaceId: WorkspaceId, fileId: FileId): Promise<string> {
     const token = await this.getToken()
     const headers: Record<string, string> = {}

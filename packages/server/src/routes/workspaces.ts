@@ -5,20 +5,13 @@ import { workspaces, workspaceMembers, fileEntries, workspaceChanges, users } fr
 import { withAuth } from "../middleware/auth.js"
 import { uuid } from "../utils.js"
 import { requireMember } from "../lib/authz.js"
-import { broadcastToWorkspace } from "../services/realtimeState.js"
+import { broadcastToWorkspace, disconnectWorkspaceClients } from "../services/realtimeState.js"
 import { recordChange } from "../lib/changeLog.js"
 import { getPlainText, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
 import { createStorageBackend } from "../storage/index.js"
 import { zipSync } from "fflate"
 
 const storage = createStorageBackend()
-
-async function incrementRevision(workspaceId: string): Promise<number> {
-  const result = await db.execute<{ revision: number }>(
-    sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${workspaceId} RETURNING revision`
-  )
-  return result[0]!.revision
-}
 
 export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
   .use(withAuth)
@@ -102,12 +95,17 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       if (!member) return status(403, { message: "Forbidden" })
       if (member.role !== "owner") return status(403, { message: "Only the owner can rename a workspace" })
 
-      const revision = await incrementRevision(params.id)
-      await db
-        .update(workspaces)
-        .set({ name: body.name })
-        .where(eq(workspaces.id, params.id))
-
+      // S6: Wrap revision bump + rename + changelog in a single transaction
+      const revision = await db.transaction(async (tx) => {
+        const [{ revision: rev }] = await tx.execute<{ revision: number }>(
+          sql`UPDATE workspaces SET revision = revision + 1, updated_at = NOW() WHERE id = ${params.id} RETURNING revision`
+        )
+        await tx
+          .update(workspaces)
+          .set({ name: body.name })
+          .where(eq(workspaces.id, params.id))
+        return rev
+      })
       await recordChange({ workspaceId: params.id, revision, type: "workspaceRenamed" })
       broadcastToWorkspace(params.id, { type: "workspaceRenamed", workspaceId: params.id, name: body.name })
 
@@ -128,6 +126,8 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       .where(eq(workspaces.id, params.id))
 
     broadcastToWorkspace(params.id, { type: "workspaceDeleted", workspaceId: params.id })
+    // S7: Force-close WS connections so clients can't keep pushing Yjs updates
+    disconnectWorkspaceClients(params.id)
 
     return { ok: true }
   })
@@ -164,22 +164,29 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
 
       if (!ws) return status(404, { message: "Workspace not found" })
 
+      // S8: Use ON CONFLICT to avoid TOCTOU between existence check and insert.
+      // If two concurrent joins hit this, one inserts and the other no-ops.
+      const result = await db
+        .insert(workspaceMembers)
+        .values({
+          workspaceId: params.id,
+          userId: user.id,
+          role: "viewer",
+          acceptedAt: new Date(),
+        })
+        .onConflictDoNothing({ target: [workspaceMembers.workspaceId, workspaceMembers.userId] })
+        .returning({ role: workspaceMembers.role })
+
+      if (result.length > 0) {
+        return { role: "viewer" as const, alreadyMember: false }
+      }
+      // Already a member — fetch existing role
       const [existing] = await db
         .select({ role: workspaceMembers.role })
         .from(workspaceMembers)
         .where(and(eq(workspaceMembers.workspaceId, params.id), eq(workspaceMembers.userId, user.id)))
         .limit(1)
-
-      if (existing) return { role: existing.role, alreadyMember: true }
-
-      await db.insert(workspaceMembers).values({
-        workspaceId: params.id,
-        userId: user.id,
-        role: "viewer",
-        acceptedAt: new Date(),
-      })
-
-      return { role: "viewer" as const, alreadyMember: false }
+      return { role: existing!.role, alreadyMember: true }
     }
   )
 
@@ -314,16 +321,30 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
             docId: f.docId ?? undefined,
             hash: f.binaryHash ?? undefined,
             size: f.binarySize ?? undefined,
+            mode: f.mode ?? undefined,
           })),
         }
       }
 
       // Incremental: return change log entries since the given revision,
-      // paginated. Fetch `limit + 1` so we can cheaply determine `hasMore`
-      // without an extra COUNT query.
+      // paginated. Left-join file_entries so fileCreated entries carry docId
+      // (the change log table doesn't store it, but the reconciler needs it
+      // to set up Yjs subscriptions for text files).
       const rows = await db
-        .select()
+        .select({
+          revision: workspaceChanges.revision,
+          type: workspaceChanges.type,
+          fileId: workspaceChanges.fileId,
+          path: workspaceChanges.path,
+          oldPath: workspaceChanges.oldPath,
+          kind: workspaceChanges.kind,
+          hash: workspaceChanges.hash,
+          size: workspaceChanges.size,
+          docId: fileEntries.docId,
+          mode: fileEntries.mode,
+        })
         .from(workspaceChanges)
+        .leftJoin(fileEntries, eq(fileEntries.id, workspaceChanges.fileId))
         .where(
           and(
             eq(workspaceChanges.workspaceId, params.id),
@@ -350,6 +371,8 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
           kind: r.kind as import("@shynkro/shared").FileKind | undefined,
           hash: r.hash ?? undefined,
           size: r.size ?? undefined,
+          docId: r.docId ?? undefined,
+          mode: r.mode ?? undefined,
         })),
       }
     },
