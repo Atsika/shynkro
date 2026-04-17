@@ -49,7 +49,7 @@ export const workspaces = pgTable("workspaces", {
   name: text("name").notNull(),
   ownerId: text("owner_id").notNull().references(() => users.id),
   revision: integer("revision").notNull().default(0),
-  status: text("status", { enum: ["active", "archived", "deleted"] }).notNull().default("active"),
+  status: text("status", { enum: ["active", "deleted"] }).notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 })

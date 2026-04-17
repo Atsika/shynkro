@@ -147,7 +147,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const found = findProjectConfig()
         if (found) {
           restClient.setBaseUrl(found.config.serverUrl)
-          startSync(found.config.serverUrl, restClient, tokenStore, context).catch(() => {})
+          startSync(found.config.serverUrl, restClient, context).catch(() => {})
         }
       }
     }),
@@ -159,12 +159,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       stopSync()
       vscode.commands.executeCommand("setContext", "shynkro.loggedIn", false)
       vscode.window.showInformationMessage("Shynkro: logged out")
-    }),
-
-    // Keep the register command as a no-op alias so the activation event
-    // in package.json doesn't break. It just forwards to the login quick-pick.
-    vscode.commands.registerCommand("shynkro.register", () => {
-      vscode.commands.executeCommand("shynkro.login")
     }),
 
     // Track / Untrack: right-click context menu on files in the explorer.
@@ -303,14 +297,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
       await executeInit(folders[0].uri.fsPath, serverUrl, authService!, restClient, (p: string) => new StateDb(p))
-      await startSync(serverUrl, restClient, tokenStore, context)
+      await startSync(serverUrl, restClient, context)
     }),
 
     vscode.commands.registerCommand("shynkro.clone", async () => {
       const serverUrl = vscode.workspace.getConfiguration("shynkro").get<string>("serverUrl") ?? "http://localhost:3000"
       restClient.setBaseUrl(serverUrl)
       await executeClone(serverUrl, authService!, restClient, (p: string) => new StateDb(p), () =>
-        startSync(serverUrl, restClient, tokenStore, context)
+        startSync(serverUrl, restClient, context)
       )
     }),
 
@@ -322,11 +316,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const ok = await authService!.login(serverUrl)
         if (!ok) return
       }
-      const workspaceId = await executeJoin(serverUrl, authService!, restClient)
+      const workspaceId = await executeJoin(restClient)
       if (!workspaceId) return
       // After joining, offer to download the files (same flow as clone)
       await executeClone(serverUrl, authService!, restClient, (p: string) => new StateDb(p), () =>
-        startSync(serverUrl, restClient, tokenStore, context),
+        startSync(serverUrl, restClient, context),
         workspaceId
       )
     }),
@@ -494,7 +488,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             db.close()
 
             vscode.window.showInformationMessage("Shynkro: workspace re-linked. Restarting sync…")
-            await startSync(serverUrl, restClient, tokenStore, context)
+            await startSync(serverUrl, restClient, context)
           } catch (err) {
             vscode.window.showErrorMessage(`Shynkro: re-link failed: ${err}`)
           }
@@ -531,7 +525,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }
 
-    startSync(serverUrl, restClient, tokenStore, context).catch((err) => {
+    startSync(serverUrl, restClient, context).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err)
       log.appendLine(`[activate] startSync failed: ${msg}`)
     })
@@ -569,7 +563,6 @@ let startSyncRunning = false
 async function startSync(
   serverUrl: string,
   restClient: RestClient,
-  _tokenStore: TokenStore,
   context: vscode.ExtensionContext
 ): Promise<void> {
   if (startSyncRunning) {
@@ -578,7 +571,7 @@ async function startSync(
   }
   startSyncRunning = true
   try {
-    await _startSyncInner(serverUrl, restClient, _tokenStore, context)
+    await _startSyncInner(serverUrl, restClient, context)
   } finally {
     startSyncRunning = false
   }
@@ -587,7 +580,6 @@ async function startSync(
 async function _startSyncInner(
   serverUrl: string,
   restClient: RestClient,
-  _tokenStore: TokenStore,
   context: vscode.ExtensionContext
 ): Promise<void> {
   const found = findProjectConfig()
@@ -655,7 +647,7 @@ async function _startSyncInner(
     binarySync!
   )
 
-  yjsBridge = new YjsBridge(wsManager, fileWatcher, stateDb, workspaceRoot, restClient)
+  yjsBridge = new YjsBridge(wsManager, fileWatcher, stateDb, workspaceRoot)
 
   // File decorations: "S" badge on synced files, "!" on binary conflicts.
   syncDecoRegistration?.dispose()

@@ -6,7 +6,6 @@ import { WS_BINARY_YJS_UPDATE, WS_BINARY_YJS_STATE, WS_BINARY_AWARENESS } from "
 import type { CursorPayload, DocId, FileId, Role, WorkspaceId } from "@shynkro/shared"
 import type { WsManager } from "../ws/wsManager"
 import type { FileWatcher } from "../sync/fileWatcher"
-import type { RestClient } from "../api/restClient"
 import { log } from "../logger"
 import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../text/textNormalize"
 import { atomicWriteFileSync } from "../text/atomicWrite"
@@ -116,9 +115,6 @@ export class YjsBridge {
     private readonly fileWatcher: FileWatcher,
     private readonly stateDb: import("../state/stateDb").StateDb,
     private readonly workspaceRoot: string,
-    // restClient kept for forward-compat / public-API stability.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    private readonly _restClient: RestClient,
   ) {
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.handleBinaryFrame(frame)),
@@ -242,20 +238,7 @@ export class YjsBridge {
       vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
     }
 
-    // Local edits → persist + send. Remote/restore origins only persist; no echo.
-    const handler = (update: Uint8Array, origin: unknown) => {
-      const isLocal = origin !== "remote" && origin !== "local-restore"
-      if (origin === "local-restore") return
-      // Persist every update (local + remote) so the doc can be rebuilt offline.
-      const acked = !isLocal
-      const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
-      if (isLocal) {
-        const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-        const sent = this.wsManager.sendBinary(frame)
-        if (sent) this.stateDb.markYjsUpdateAcked(id)
-      }
-      this.maybeCompact(docId, yDoc)
-    }
+    const handler = this.createUpdateHandler(docId, yDoc)
     this.updateHandlers.set(docId, handler)
     yDoc.on("update", handler)
 
@@ -274,10 +257,26 @@ export class YjsBridge {
       hasReceivedState: false,
     }
     this.backgroundDocs.set(docId, bgEntry)
-    // Background docs also persist their updates so a reload preserves state.
-    const handler = (update: Uint8Array, origin: unknown) => {
-      const isLocal = origin !== "remote" && origin !== "local-restore"
+    const handler = this.createUpdateHandler(docId, yDoc)
+    this.updateHandlers.set(docId, handler)
+    yDoc.on("update", handler)
+    this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
+  }
+
+  private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
+    return this.updateHandlers.get(docId) ?? (() => {})
+  }
+
+  /**
+   * Factory for the `yDoc.on("update")` handler. Every mount site (openDoc,
+   * subscribeBackground, handleDocClose → background) shares the same policy:
+   * persist local + remote updates, send locals over the wire, ack on send,
+   * and nudge the compactor.
+   */
+  private createUpdateHandler(docId: string, yDoc: Y.Doc): (update: Uint8Array, origin: unknown) => void {
+    return (update, origin) => {
       if (origin === "local-restore") return
+      const isLocal = origin !== "remote"
       const acked = !isLocal
       const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
       if (isLocal) {
@@ -287,13 +286,29 @@ export class YjsBridge {
       }
       this.maybeCompact(docId, yDoc)
     }
-    this.updateHandlers.set(docId, handler)
-    yDoc.on("update", handler)
-    this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
   }
 
-  private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
-    return this.updateHandlers.get(docId) ?? (() => {})
+  /**
+   * On receipt of an initial server state frame, ack any local updates the
+   * server has already absorbed, so the compactor can reclaim them. Called
+   * from both foreground and background paths — identical logic.
+   */
+  private trimAckedLocalUpdates(docId: string, frameData: Uint8Array, yDoc: Y.Doc): void {
+    try {
+      const serverProbe = new Y.Doc()
+      Y.applyUpdate(serverProbe, frameData, "remote")
+      const serverVec = Y.encodeStateVector(serverProbe)
+      serverProbe.destroy()
+      const unacked = this.stateDb.loadUnackedLocalUpdates(docId)
+      for (const u of unacked) {
+        const remaining = Y.diffUpdate(u.bytes, serverVec)
+        // diffUpdate returns a "header-only" update of length 2 when nothing remains.
+        if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
+      }
+      this.maybeCompact(docId, yDoc)
+    } catch (err) {
+      log.appendLine(`[yjsBridge] state-vector trim failed for ${docId}: ${err}`)
+    }
   }
 
   private evictStaleEntriesForPath(filePath: string, exceptDocId: string): void {
@@ -563,26 +578,8 @@ export class YjsBridge {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
         Y.applyUpdate(entry.yDoc, frame.data, "remote")
         if (isInitialState) {
-          // Server state arrived: trim acked-status of our local pending updates.
-          // Compute the server's state vector, then mark any local update whose
-          // changes are subsumed as acked. Any unsent locals we still have are
-          // either (a) already in the server's state vector → safe to ack and
-          // compact, or (b) not yet — they'll be sent on the next handler tick.
-          try {
-            const serverProbe = new Y.Doc()
-            Y.applyUpdate(serverProbe, frame.data, "remote")
-            const serverVec = Y.encodeStateVector(serverProbe)
-            serverProbe.destroy()
-            const unacked = this.stateDb.loadUnackedLocalUpdates(frame.docId)
-            for (const u of unacked) {
-              const remaining = Y.diffUpdate(u.bytes, serverVec)
-              // diffUpdate returns the "header-only" update of length 2 when nothing remains.
-              if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
-            }
-            this.maybeCompact(frame.docId, entry.yDoc)
-          } catch (err) {
-            log.appendLine(`[yjsBridge] state-vector trim failed for ${frame.docId}: ${err}`)
-          }
+          // Server state arrived: ack any local updates it already absorbed.
+          this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
           entry.hasReceivedState = true
         }
         this.applyDocToEditor(entry).catch(() => {})
@@ -614,20 +611,7 @@ export class YjsBridge {
         Y.applyUpdate(bgEntry.yDoc, frame.data, "remote")
         if (isInitialState) {
           bgEntry.hasReceivedState = true
-          try {
-            const serverProbe = new Y.Doc()
-            Y.applyUpdate(serverProbe, frame.data, "remote")
-            const serverVec = Y.encodeStateVector(serverProbe)
-            serverProbe.destroy()
-            const unacked = this.stateDb.loadUnackedLocalUpdates(frame.docId)
-            for (const u of unacked) {
-              const remaining = Y.diffUpdate(u.bytes, serverVec)
-              if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
-            }
-            this.maybeCompact(frame.docId, bgEntry.yDoc)
-          } catch (err) {
-            log.appendLine(`[yjsBridge] bg state-vector trim failed for ${frame.docId}: ${err}`)
-          }
+          this.trimAckedLocalUpdates(frame.docId, frame.data, bgEntry.yDoc)
         }
         this.scheduleBackgroundWrite(frame.docId, bgEntry)
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
@@ -759,19 +743,7 @@ export class YjsBridge {
         hasReceivedState: entry.hasReceivedState,
       }
       this.backgroundDocs.set(docId, bgEntry)
-      // Re-attach a background handler so future updates persist + send.
-      const bgHandler = (update: Uint8Array, origin: unknown) => {
-        const isLocal = origin !== "remote" && origin !== "local-restore"
-        if (origin === "local-restore") return
-        const acked = !isLocal
-        const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
-        if (isLocal) {
-          const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-          const sent = this.wsManager.sendBinary(frame)
-          if (sent) this.stateDb.markYjsUpdateAcked(id)
-        }
-        this.maybeCompact(docId, entry.yDoc)
-      }
+      const bgHandler = this.createUpdateHandler(docId, entry.yDoc)
       this.updateHandlers.set(docId, bgHandler)
       entry.yDoc.on("update", bgHandler)
       log.appendLine(`[yjsBridge] editor closed, demoted to background: ${path.basename(entry.filePath)}`)

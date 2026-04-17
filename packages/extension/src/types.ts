@@ -32,7 +32,7 @@ export interface SyncState {
   lastSyncAt: string
 }
 
-export type ConnectionStatus = "idle" | "disconnected" | "connecting" | "connected" | "syncing"
+export type ConnectionStatus = "idle" | "disconnected" | "connecting" | "connected"
 
 export interface ExtensionDeps {
   workspaceRoot: string

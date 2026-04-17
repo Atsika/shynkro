@@ -1,6 +1,5 @@
 import type {
   AuthResponse,
-  AuthTokens,
   BeginImportResponse,
   ChangesResponse,
   CreateFileBody,
@@ -10,7 +9,6 @@ import type {
   InviteMemberBody,
   JoinWorkspaceResponse,
   LoginBody,
-  RefreshBody,
   RegisterBody,
   RenameFileBody,
   Role,
@@ -108,9 +106,6 @@ export class RestClient {
   }
   register(body: RegisterBody): Promise<AuthResponse> {
     return this.request("POST", "/api/v1/auth/register", body)
-  }
-  refresh(body: RefreshBody): Promise<AuthTokens> {
-    return this.request("POST", "/api/v1/auth/refresh", body)
   }
   me(): Promise<UserInfo> {
     return this.request("GET", "/api/v1/auth/me")

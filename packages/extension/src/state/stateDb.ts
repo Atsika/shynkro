@@ -82,22 +82,6 @@ export class StateDb {
       // crash between "server applied" and "client acked".
       this.addColumnIfMissing("pending_ops", "op_id", "TEXT")
     }
-    if (currentVersion < 4) {
-      // V4: pending_yjs_frames — persistence for Yjs updates that are buffered
-      // while the WS is disconnected. Previously held in memory on WsManager,
-      // which meant any extension reload (VS Code restart, Developer: Reload
-      // Window, crash) silently dropped unsent edits. CREATE TABLE IF NOT EXISTS
-      // above handles fresh databases; existing installs get the table created
-      // here idempotently via the same DDL.
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS pending_yjs_frames (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          doc_id     TEXT NOT NULL,
-          data       BLOB NOT NULL,
-          created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-      `)
-    }
     if (currentVersion < 5) {
       // V5: file_map gains deleted_at so the tombstone-prune job has an age to
       // compare against. Rows are tombstoned (deleted=1) when the user deletes
@@ -142,7 +126,7 @@ export class StateDb {
   // validated against a conservative whitelist pattern before interpolation —
   // ALTER TABLE does not accept bound parameters, so we must interpolate.
   private addColumnIfMissing(
-    table: "file_map" | "pending_ops" | "pending_yjs_frames",
+    table: "file_map" | "pending_ops",
     column: string,
     type: string
   ): void {
@@ -351,42 +335,6 @@ export class StateDb {
 
   removePendingOp(id: number): void {
     this.db.prepare("DELETE FROM pending_ops WHERE id = ?").run(id)
-  }
-
-  // ---- Pending Yjs frames (offline queue for binary WS updates) ----
-
-  /**
-   * Persist a Yjs binary frame that could not be sent because the WS was not
-   * open. The frame is the full pre-built wire format (frameType + docId +
-   * payload) so replay is a plain `ws.send(row.data)` call.
-   */
-  enqueueYjsFrame(docId: string, data: Uint8Array): void {
-    // node:sqlite bind expects Buffer for BLOB
-    const buf = Buffer.from(data)
-    this.db
-      .prepare("INSERT INTO pending_yjs_frames (doc_id, data) VALUES (?, ?)")
-      .run(docId, buf)
-  }
-
-  allPendingYjsFrames(): Array<{ id: number; docId: string; data: Uint8Array }> {
-    const rows = this.db
-      .prepare("SELECT id, doc_id as docId, data FROM pending_yjs_frames ORDER BY id ASC")
-      .all() as Array<{ id: number; docId: string; data: Buffer | Uint8Array }>
-    return rows.map((r) => ({
-      id: r.id,
-      docId: r.docId,
-      data: r.data instanceof Buffer ? new Uint8Array(r.data) : r.data,
-    }))
-  }
-
-  removePendingYjsFrame(id: number): void {
-    this.db.prepare("DELETE FROM pending_yjs_frames WHERE id = ?").run(id)
-  }
-
-  /** Count — cheap metric for health/diagnostics output. */
-  pendingYjsFrameCount(): number {
-    const row = this.db.prepare("SELECT COUNT(*) as c FROM pending_yjs_frames").get() as { c: number }
-    return row.c
   }
 
   // ---- Local Yjs persistence (V6) ----

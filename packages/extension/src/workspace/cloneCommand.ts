@@ -62,7 +62,7 @@ export async function executeClone(
 
   let workspaceId: string
   if (picked.workspaceId === "__join__") {
-    const joined = await executeJoin(serverUrl, authService, restClient)
+    const joined = await executeJoin(restClient)
     if (!joined) return
     workspaceId = joined
   } else {
@@ -173,8 +173,6 @@ async function cloneWorkspace(
  * or return null if the user cancelled or the workspace was not found.
  */
 export async function executeJoin(
-  _serverUrl: string,
-  _authService: AuthService,
   restClient: RestClient,
 ): Promise<string | null> {
   const id = await vscode.window.showInputBox({
