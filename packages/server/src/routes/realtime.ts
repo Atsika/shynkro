@@ -13,6 +13,7 @@ import {
   broadcastToDoc,
   getWorkspacePresence,
   debouncedPresenceBroadcast,
+  recordImmediatePresenceBroadcast,
   findOwner,
 } from "../services/realtimeState.js"
 import {
@@ -41,6 +42,17 @@ const WS_MAX_FRAME_BYTES = envInt("SHYNKRO_WS_MAX_FRAME", 50 * 1024 * 1024)
 // Map from ws to context (Elysia ws lacks generic data on ServerWebSocket)
 const ctxMap = new Map<object, WsContext>()
 
+/**
+ * Per-WS message processing chain. Bun's WS handler fires `message` async and
+ * does not serialize them, so two messages can race — e.g. `subscribeDoc`
+ * reaches the in-memory `ctx.subscribedWorkspaces.has(...)` check before the
+ * preceding `subscribeWorkspace`'s DB query has resolved and called
+ * `subscribeToWorkspace`. We chain each message's processing on the previous
+ * one so a single connection's messages stay ordered without serializing
+ * across connections.
+ */
+const procChain = new WeakMap<object, Promise<void>>()
+
 export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
   // --- open ---
   open(_ws) {
@@ -49,6 +61,41 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
 
   // --- message ---
   async message(ws, rawMessage) {
+    const prev = procChain.get(ws.raw) ?? Promise.resolve()
+    const next = prev.then(() => processMessage(ws, rawMessage)).catch((err) => {
+      logger.error("ws processMessage error", { err: String(err) })
+    })
+    procChain.set(ws.raw, next)
+    await next
+  },
+
+  // --- close ---
+  close(ws) {
+    procChain.delete(ws.raw)
+    const ctx = ctxMap.get(ws.raw)
+    if (ctx) {
+      for (const timer of ctx.awarenessTimeouts.values()) clearTimeout(timer)
+      ctx.awarenessTimeouts.clear()
+      if (ctx.expiryWarningTimer) clearTimeout(ctx.expiryWarningTimer)
+      if (ctx.expiryCloseTimer) clearTimeout(ctx.expiryCloseTimer)
+      const workspaces = [...ctx.subscribedWorkspaces]
+      unregisterClient(ctx)
+      for (const workspaceId of workspaces) {
+        broadcastToWorkspace(workspaceId, {
+          type: "presenceUpdate",
+          workspaceId,
+          users: getWorkspacePresence(workspaceId),
+        })
+        recordImmediatePresenceBroadcast(workspaceId)
+        debouncedPresenceBroadcast(workspaceId)
+      }
+      ctxMap.delete(ws.raw)
+    }
+  },
+})
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function processMessage(ws: any, rawMessage: unknown): Promise<void> {
     const ctx = ctxMap.get(ws.raw)
 
     // Handle binary frames (Yjs updates)
@@ -207,14 +254,6 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
 
     // ---- subscribeWorkspace ----
     if (msg.type === "subscribeWorkspace") {
-      // Subscribe optimistically before the DB query so that a subscribeDoc
-      // message that arrives while we await the membership check doesn't get
-      // rejected with "Not subscribed to workspace". The subscribeDoc handler
-      // still verifies doc ownership, so the security exposure is minimal.
-      // If the membership check fails we roll back immediately.
-      subscribeToWorkspace(ctx, msg.workspaceId)
-      ctx.role = "viewer" // safe default until DB confirms role
-
       const [member] = await db
         .select()
         .from(workspaceMembers)
@@ -227,12 +266,12 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         .limit(1)
 
       if (!member) {
-        ctx.subscribedWorkspaces.delete(msg.workspaceId) // roll back optimistic subscribe
         ws.send(JSON.stringify({ type: "error", code: "FORBIDDEN", message: "Not a workspace member" }))
         return
       }
 
       ctx.role = member.role as "owner" | "editor" | "viewer"
+      subscribeToWorkspace(ctx, msg.workspaceId)
 
       // Immediate broadcast — gives instant feedback to the subscribing client
       const presence = getWorkspacePresence(msg.workspaceId)
@@ -247,9 +286,11 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
         workspaceId: msg.workspaceId,
         users: presence,
       })
+      recordImmediatePresenceBroadcast(msg.workspaceId)
       // Deferred follow-up catches concurrent subscriptions (e.g. two clients
       // reconnecting after a window reload at the same time — each async handler
       // yields at the DB query and neither sees the other's subscription yet).
+      // Skipped as a no-op if presence hasn't changed in the meantime.
       debouncedPresenceBroadcast(msg.workspaceId)
       return
     }
@@ -368,42 +409,16 @@ export const realtimeRoutes = new Elysia().ws("/api/v1/realtime", {
       ctx.awarenessTimeouts.set(msg.docId, timer)
       return
     }
-  },
-
-  // --- close ---
-  close(ws) {
-    const ctx = ctxMap.get(ws.raw)
-    if (ctx) {
-      // Clear all awareness TTL timers
-      for (const timer of ctx.awarenessTimeouts.values()) clearTimeout(timer)
-      ctx.awarenessTimeouts.clear()
-      // S5: Clear expiry timers
-      if (ctx.expiryWarningTimer) clearTimeout(ctx.expiryWarningTimer)
-      if (ctx.expiryCloseTimer) clearTimeout(ctx.expiryCloseTimer)
-
-      // Snapshot workspace list before unregistering (unregister clears the sets)
-      const workspaces = [...ctx.subscribedWorkspaces]
-      unregisterClient(ctx)
-      // Broadcast departure presence update to all subscribed workspaces
-      for (const workspaceId of workspaces) {
-        broadcastToWorkspace(workspaceId, {
-          type: "presenceUpdate",
-          workspaceId,
-          users: getWorkspacePresence(workspaceId),
-        })
-        // Deferred follow-up in case a replacement connection is subscribing
-        // concurrently (common during window reload: close + reopen overlap).
-        debouncedPresenceBroadcast(workspaceId)
-      }
-      ctxMap.delete(ws.raw)
-    }
-  },
-})
+}
 
 /** S5: Schedule JWT expiry warning + auto-close timers. Stores handles on ctx for cancellation. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function scheduleExpiryTimers(ctx: WsContext, ws: any, exp: number): void {
   const msUntilExpiry = exp * 1000 - Date.now()
+  if (msUntilExpiry <= 0) {
+    ws.close(4001, "Auth expired")
+    return
+  }
   const warnAt = msUntilExpiry - TOKEN_EXPIRY_WARNING_SECS * 1000
   if (warnAt > 0) {
     ctx.expiryWarningTimer = setTimeout(() => {
@@ -412,11 +427,13 @@ function scheduleExpiryTimers(ctx: WsContext, ws: any, exp: number): void {
         ws.send(JSON.stringify({ type: "tokenExpiring", expiresIn: TOKEN_EXPIRY_WARNING_SECS }))
       }
     }, warnAt)
-    ctx.expiryCloseTimer = setTimeout(() => {
-      ctx.expiryCloseTimer = null
-      if (ctxMap.has(ws.raw)) {
-        ws.close(4001, "Auth expired")
-      }
-    }, msUntilExpiry)
+  } else if (ctxMap.has(ws.raw)) {
+    ws.send(JSON.stringify({ type: "tokenExpiring", expiresIn: Math.max(1, Math.floor(msUntilExpiry / 1000)) }))
   }
+  ctx.expiryCloseTimer = setTimeout(() => {
+    ctx.expiryCloseTimer = null
+    if (ctxMap.has(ws.raw)) {
+      ws.close(4001, "Auth expired")
+    }
+  }, msUntilExpiry)
 }

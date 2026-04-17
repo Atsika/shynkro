@@ -12,6 +12,12 @@ export interface FileMapRow {
   kind: string
   docId: string | null
   binaryHash: string | null
+  /**
+   * V6: Last hash known to be in sync with the server. Diverges from
+   * `binaryHash` while a local edit is pending upload — the binary conflict
+   * picker uses the divergence to detect "both sides changed".
+   */
+  syncedBinaryHash: string | null
   /** "lf" | "crlf" — null if not yet sniffed (binary, folder, or pre-Unit-A row) */
   eolStyle: "lf" | "crlf" | null
   /** SQLite stores 0/1; truthy means the on-disk file starts with a UTF-8 BOM */

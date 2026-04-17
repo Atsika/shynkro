@@ -195,7 +195,7 @@ export async function executeJoin(
   }
 
   const confirm = await vscode.window.showInformationMessage(
-    `Join "${info.name}" (owned by ${info.ownerDisplayName})? You will join as a viewer.`,
+    `Join "${info.name}" (owned by ${info.ownerDisplayName})?`,
     "Join", "Cancel"
   )
   if (confirm !== "Join") return null
@@ -203,7 +203,7 @@ export async function executeJoin(
   try {
     const result = await restClient.joinWorkspace(workspaceId)
     if (!result.alreadyMember) {
-      vscode.window.showInformationMessage(`Shynkro: joined "${info.name}" as viewer`)
+      vscode.window.showInformationMessage(`Shynkro: joined "${info.name}"`)
     }
     return workspaceId
   } catch (err) {

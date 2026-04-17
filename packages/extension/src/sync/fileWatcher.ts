@@ -183,6 +183,33 @@ export class FileWatcher {
     // Skip files already known (e.g. from import) — avoids 409 on init
     if (this.stateDb.getFileByPath(relPath)) return
 
+    // File-replace via tombstone: `rm foo && create foo` where the debounce
+    // window already elapsed. Two sub-cases:
+    //  (a) delete was still queued in pending_ops (offline) → cancel it,
+    //      un-tombstone the fileId, route as a content change. Server never
+    //      saw the delete; file identity is preserved end-to-end.
+    //  (b) delete already committed to the server (online) → can't revive
+    //      the old fileId; purge the local tombstone so the UNIQUE(path)
+    //      constraint admits the new row, then fall through to fresh create.
+    //      The locallyInitiatedDeletes set (set in executeDelete) still
+    //      suppresses the disk rm when the delete echo arrives.
+    const tombstone = this.stateDb.getTombstoneByPath(relPath)
+    if (tombstone) {
+      const droppedOps = this.stateDb.dropPendingDeleteOpsForFileId(tombstone.fileId)
+      if (droppedOps > 0) {
+        log.appendLine(`[watcher] file-replace (offline delete cancelled) for ${relPath} — reviving fileId ${tombstone.fileId}`)
+        this.stateDb.undeleteFile(tombstone.fileId)
+        setTimeout(() => {
+          this.handleChange(uri).catch((err) =>
+            log.appendLine(`[watcher] post-tombstone change error for ${relPath}: ${err}`)
+          )
+        }, 50)
+        return
+      }
+      log.appendLine(`[watcher] file-replace (server delete already committed) for ${relPath} — falling through to fresh create`)
+      this.stateDb.purgeFile(tombstone.fileId)
+    }
+
     // Fast local case-insensitive collision check — catches the collision
     // before the server round-trip. VS Code already wrote the file to disk
     // by the time onDidCreate fires, so we can't prevent creation. We warn
@@ -372,7 +399,7 @@ export class FileWatcher {
   /** Actually run the delete after the debounce window expires. */
   private executeDelete(uri: vscode.Uri, fileId: string, relPath: string): void {
     this.stateDb.deleteFile(fileId)
-    this._onFileDeleted.fire({ absPath: uri.fsPath, remote: false })
+    this._onFileDeleted.fire({ absPath: uri.fsPath, fileId, remote: false })
 
     if (!this.wsManager.connected) {
       this.stateDb.enqueuePendingOp({ opType: "delete", path: relPath, fileId })
@@ -385,7 +412,7 @@ export class FileWatcher {
   }
 
   /** Fires when a tracked file is deleted locally or remotely. */
-  private readonly _onFileDeleted = new vscode.EventEmitter<{ absPath: string; remote: boolean }>()
+  private readonly _onFileDeleted = new vscode.EventEmitter<{ absPath: string; fileId?: string; remote: boolean }>()
   readonly onFileDeleted = this._onFileDeleted.event
 
   dispose(): void {

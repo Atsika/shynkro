@@ -32,6 +32,24 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     if (!file) return status(404, { message: "File not found" })
     if (file.kind !== "binary") return status(400, { message: "Not a binary file" })
 
+    // If-Match: <hex hash> — concurrency guard for the binary conflict picker.
+    // Reject if the file's current binaryHash has moved since the picker opened
+    // (another resolver already pushed). The losing client re-opens its picker
+    // against the new server state. Only enforced when the header is present so
+    // ordinary uploads stay backwards-compatible.
+    const ifMatch = request.headers.get("if-match")
+    if (ifMatch !== null && ifMatch !== "" && ifMatch !== "*") {
+      // Strip optional surrounding quotes per RFC 7232.
+      const expected = ifMatch.replace(/^"+|"+$/g, "")
+      if (file.binaryHash !== expected) {
+        return status(412, {
+          code: "HASH_MISMATCH",
+          message: `Server hash diverged: expected ${expected}, currently ${file.binaryHash ?? "<none>"}`,
+          currentHash: file.binaryHash,
+        })
+      }
+    }
+
     const clientHash = request.headers.get("x-content-hash")
     // Per-upload POSIX mode bits, sent only by clients running on POSIX hosts.
     // Sanitize aggressively: never trust the client past the 9-bit mode mask.

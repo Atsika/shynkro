@@ -37,7 +37,20 @@ export class BinarySync {
     })
   }
 
-  async upload(fileId: FileId, localPath: string, workspaceId: WorkspaceId): Promise<void> {
+  /**
+   * Upload a binary file to the server.
+   *
+   * @param ifMatch  Concurrency guard for the binary conflict picker. When
+   *                 set, server returns 412 if its current hash for this file
+   *                 has moved — caller treats that as "another resolver already
+   *                 pushed" and reopens the picker against the new state.
+   */
+  async upload(
+    fileId: FileId,
+    localPath: string,
+    workspaceId: WorkspaceId,
+    ifMatch?: string | null,
+  ): Promise<void> {
     let stat: fs.Stats
     try {
       stat = fs.statSync(localPath)
@@ -53,7 +66,7 @@ export class BinarySync {
     if (this.chunked && stat.size > CHUNKED_UPLOAD_THRESHOLD) {
       try {
         const { hash } = await this.chunked.uploader.upload(workspaceId, fileId, localPath)
-        this.stateDb.updateBinaryHash(fileId, hash)
+        this.stateDb.setSyncedBinaryHash(fileId, hash)
         if (fileMode !== null) this.stateDb.setFileMode(fileId, fileMode)
         log.appendLine(`[binarySync] chunked upload complete for ${path.basename(localPath)} (${stat.size} bytes, hash=${hash.slice(0, 12)}…)`)
         return
@@ -66,11 +79,14 @@ export class BinarySync {
     // Single-shot path for files at-or-below the threshold.
     const hash = await this.computeHash(localPath)
     const row = this.stateDb.getFileById(fileId)
-    if (row?.binaryHash === hash) return // no change
+    // Skip only if both the local hash AND the synced hash already match —
+    // re-uploading after a failed earlier attempt is the desired behavior when
+    // local and synced have diverged.
+    if (row?.binaryHash === hash && row?.syncedBinaryHash === hash) return
 
     const data = fs.readFileSync(localPath)
-    await this.restClient.uploadBlob(workspaceId, fileId, data, hash, fileMode)
-    this.stateDb.updateBinaryHash(fileId, hash)
+    await this.restClient.uploadBlob(workspaceId, fileId, data, hash, fileMode, ifMatch)
+    this.stateDb.setSyncedBinaryHash(fileId, hash)
     if (fileMode !== null) this.stateDb.setFileMode(fileId, fileMode)
   }
 
@@ -85,7 +101,7 @@ export class BinarySync {
         try {
           this.fileWatcher.addWriteTag(localPath)
           const result = await this.chunked.downloader.download(workspaceId, fileId, localPath)
-          this.stateDb.updateBinaryHash(fileId, result.hash)
+          this.stateDb.setSyncedBinaryHash(fileId, result.hash)
           if (result.mode !== null) this.stateDb.setFileMode(fileId, result.mode)
           log.appendLine(`[binarySync] chunked download complete for ${path.basename(localPath)} (${result.size} bytes)`)
           return
@@ -100,7 +116,7 @@ export class BinarySync {
     // Atomic write: a crash mid-transfer leaves the target untouched.
     this.fileWatcher.addWriteTag(localPath)
     atomicWriteFileSync(localPath, data)
-    this.stateDb.updateBinaryHash(fileId, hash)
+    this.stateDb.setSyncedBinaryHash(fileId, hash)
     if (mode !== null) this.stateDb.setFileMode(fileId, mode)
     if (!IS_WINDOWS && mode !== null) {
       try {

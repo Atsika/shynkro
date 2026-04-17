@@ -111,30 +111,17 @@
         "title": "Unfollow"
       },
       {
-        "command": "shynkro.acceptLocalHunk",
-        "title": "Shynkro: Accept My Changes"
-      },
-      {
-        "command": "shynkro.acceptServerHunk",
-        "title": "Shynkro: Accept Server's Changes"
+        "command": "shynkro.resolveBinaryConflict",
+        "title": "Shynkro: Resolve Binary Conflict"
       }
     ],
-    "keybindings": [
-      {
-        "command": "shynkro.acceptLocalHunk",
-        "key": "ctrl+shift+y",
-        "mac": "cmd+shift+y",
-        "when": "shynkro.hasActiveConflict"
-      },
-      {
-        "command": "shynkro.acceptServerHunk",
-        "key": "ctrl+shift+n",
-        "mac": "cmd+shift+n",
-        "when": "shynkro.hasActiveConflict"
-      }
-    ],
+    "keybindings": [],
     "menus": {
-      "commandPalette": [],
+      "commandPalette": [
+        { "command": "shynkro.trackFile", "when": "false" },
+        { "command": "shynkro.untrackFile", "when": "false" },
+        { "command": "shynkro.resolveBinaryConflict", "when": "false" }
+      ],
       "explorer/context": [
         {
           "command": "shynkro.trackFile",

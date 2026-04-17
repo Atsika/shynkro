@@ -37,6 +37,13 @@ export interface ChunkedDownloadResult {
 export interface ChunkedDownloaderDeps {
   baseUrl: string
   getToken: () => Promise<string | undefined>
+  /**
+   * H10: invoked with the destination path immediately before the atomic
+   * rename. The FileWatcher uses this to ignore the resulting onCreate event
+   * so a "Take theirs" pull doesn't trigger a spurious onBinaryChanged →
+   * upload loop.
+   */
+  addWriteTag?: (absPath: string) => void
 }
 
 export class ChunkedDownloader {
@@ -60,6 +67,9 @@ export class ChunkedDownloader {
     }
     const totalSize = parseTotalSizeFromContentRange(probe.headers.get("content-range")) ??
       parseInt(probe.headers.get("content-length") ?? "0", 10)
+    if (!Number.isFinite(totalSize) || totalSize <= 0) {
+      throw new Error(`[chunked-download] probe returned no valid size (Content-Range and Content-Length both missing/zero) for ${fileId}`)
+    }
     const remoteHash = probe.headers.get("x-content-hash") ?? ""
     const modeHeader = probe.headers.get("x-file-mode")
     const mode = modeHeader !== null && Number.isFinite(parseInt(modeHeader, 10))
@@ -91,8 +101,15 @@ export class ChunkedDownloader {
           const out = fs.createWriteStream(tmpPath)
           const hasher = crypto.createHash("sha256")
           let received = 0
+          // Single stream-level error listener — re-registering per chunk (the
+          // prior code) leaked listeners and tripped Node's MaxListeners warning
+          // for very large files.
+          let streamError: Error | null = null
+          const onError = (err: Error): void => { streamError = err }
+          out.on("error", onError)
           try {
             for (let start = 0; start < totalSize; start += DEFAULT_CHUNK_SIZE) {
+              if (streamError) throw streamError
               const end = Math.min(start + DEFAULT_CHUNK_SIZE, totalSize) - 1
               const res = await fetch(url, {
                 headers: { ...headers, Range: `bytes=${start}-${end}` },
@@ -108,14 +125,20 @@ export class ChunkedDownloader {
                 if (done) break
                 if (!value) continue
                 hasher.update(value)
-                await new Promise<void>((resolve, reject) => {
-                  if (!out.write(value)) {
-                    out.once("drain", () => resolve())
-                  } else {
-                    resolve()
-                  }
-                  out.on("error", reject)
-                })
+                if (!out.write(value)) {
+                  await new Promise<void>((resolve, reject) => {
+                    const onDrain = (): void => {
+                      out.off("error", onErrorOnce)
+                      resolve()
+                    }
+                    const onErrorOnce = (err: Error): void => {
+                      out.off("drain", onDrain)
+                      reject(err)
+                    }
+                    out.once("drain", onDrain)
+                    out.once("error", onErrorOnce)
+                  })
+                }
                 chunkLen += value.byteLength
               }
               received += chunkLen
@@ -126,10 +149,12 @@ export class ChunkedDownloader {
               })
             }
           } finally {
+            out.off("error", onError)
             await new Promise<void>((resolve, reject) =>
               out.end((err: Error | null | undefined) => (err ? reject(err) : resolve()))
             )
           }
+          if (streamError) throw streamError
           return { received, hash: hasher.digest("hex") }
         }
       )
@@ -149,6 +174,10 @@ export class ChunkedDownloader {
       throw new Error(`download size mismatch: got ${result.received}, expected ${totalSize}`)
     }
 
+    // H10: Tag the destination so the FileWatcher's onCreate handler skips
+    // this write. Without the tag, every "Take theirs" pull would echo as a
+    // local change → spurious re-upload.
+    this.deps.addWriteTag?.(targetPath)
     // Atomic move into place.
     fs.renameSync(tmpPath, targetPath)
 
