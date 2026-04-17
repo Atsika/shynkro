@@ -146,7 +146,8 @@ export class AuthService {
     const delay = Math.max(0, msUntilExpiry - TOKEN_REFRESH_BEFORE_EXPIRY_MS)
 
     this.refreshTimer = setTimeout(() => {
-      this.getValidAccessToken(serverUrl).catch(() => {})
+      this.getValidAccessToken(serverUrl)
+        .catch((err) => log.appendLine(`[auth] proactive token refresh failed (will retry on next API call): ${err}`))
     }, delay)
   }
 

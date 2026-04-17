@@ -220,7 +220,7 @@ export class WsManager {
     } else if (msg.type === "tokenExpiring") {
       this.authService.getValidAccessToken(this.serverUrl).then((t) => {
         if (t) this.sendJson({ type: "refreshToken", token: t })
-      }).catch(() => {})
+      }).catch((err) => log.appendLine(`[ws] tokenExpiring refresh failed: ${err}`))
     } else if (msg.type === "error") {
       // Suppress transient protocol errors that are not actionable by the user.
       // FORBIDDEN/NOT_AUTHENTICATED/DOC_DELETED are handled by higher-level code;
