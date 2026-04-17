@@ -21,7 +21,6 @@
     "onCommand:shynkro.init",
     "onCommand:shynkro.clone",
     "onCommand:shynkro.login",
-    "onCommand:shynkro.register",
     "onCommand:shynkro.logout",
     "onCommand:shynkro.relink",
     "onCommand:shynkro.join",
@@ -45,10 +44,6 @@
       {
         "command": "shynkro.login",
         "title": "Shynkro: Login / Register"
-      },
-      {
-        "command": "shynkro.register",
-        "title": "Shynkro: Register"
       },
       {
         "command": "shynkro.logout",

@@ -2,6 +2,8 @@ import { Elysia } from "elysia"
 import { healthRoutes } from "./routes/health.js"
 import { authRoutes } from "./routes/auth.js"
 import { workspaceRoutes } from "./routes/workspaces.js"
+import { changeRoutes } from "./routes/changes.js"
+import { exportRoutes } from "./routes/export.js"
 import { importRoutes } from "./routes/import.js"
 import { fileRoutes } from "./routes/files.js"
 import { blobRoutes } from "./routes/blobs.js"
@@ -68,6 +70,8 @@ const app = new Elysia()
   .use(healthRoutes)
   .use(authRoutes)
   .use(workspaceRoutes)
+  .use(changeRoutes)
+  .use(exportRoutes)
   .use(importRoutes)
   .use(fileRoutes)
   .use(blobRoutes)

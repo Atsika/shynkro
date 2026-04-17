@@ -26,6 +26,7 @@ import { and, eq, sql } from "drizzle-orm"
 import * as nodeFs from "node:fs"
 import { db } from "../db/index.js"
 import { fileEntries, uploadSessions } from "../db/schema.js"
+import { activeFileById } from "../db/predicates.js"
 import { withAuth } from "../middleware/auth.js"
 import { uuid } from "../utils.js"
 import { requireMember } from "../lib/authz.js"
@@ -94,7 +95,7 @@ export const uploadSessionRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id"
       const [file] = await db
         .select()
         .from(fileEntries)
-        .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+        .where(activeFileById(params.fileId))
         .limit(1)
       if (!file) return status(404, { message: "File not found" })
       if (file.kind !== "binary") return status(400, { message: "Not a binary file" })

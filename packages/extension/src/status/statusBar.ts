@@ -6,7 +6,6 @@ const ICONS: Record<ConnectionStatus, string> = {
   disconnected: "$(debug-disconnect)",
   connecting:   "$(sync~spin)",
   connected:    "$(sync)",
-  syncing:      "$(sync~spin)",
 }
 
 const LABELS: Record<ConnectionStatus, string> = {
@@ -14,7 +13,6 @@ const LABELS: Record<ConnectionStatus, string> = {
   disconnected: "Disconnected",
   connecting:   "Connecting…",
   connected:    "Connected",
-  syncing:      "Syncing…",
 }
 
 export class StatusBar {
@@ -38,10 +36,6 @@ export class StatusBar {
   setStatus(status: ConnectionStatus): void {
     this.item.text = `${ICONS[status]} Shynkro: ${LABELS[status]}`
     this.item.tooltip = `Shynkro — ${LABELS[status]}`
-  }
-
-  setMessage(text: string): void {
-    this.item.text = `$(sync~spin) Shynkro: ${text}`
   }
 
   setConflicts(n: number): void {

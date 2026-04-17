@@ -213,20 +213,37 @@ export class BinaryConflictPicker implements vscode.Disposable {
 
   /** Refetch the server hash after a 412 and decide whether to keep the picker open. */
   private async refreshFromServer(state: ConflictState): Promise<void> {
+    let probe: Awaited<ReturnType<typeof this.restClient.probeBlobSize>>
     try {
-      const probe = await this.restClient.probeBlobSize(state.workspaceId, state.fileId as FileId)
-      const newServerHash = probe.hash
-      if (newServerHash === state.localHash) {
-        this.stateDb.setSyncedBinaryHash(state.fileId, newServerHash)
-        this.closeActive(state.fileId)
-        return
-      }
-      state.serverHash = newServerHash
-      if (state.picker) state.picker.title = this.pickerTitle(state.localPath, true)
-      else this.showPicker(state)
+      probe = await this.restClient.probeBlobSize(state.workspaceId, state.fileId as FileId)
     } catch (err) {
+      // Don't silently disappear the conflict — re-show the picker with the
+      // stale hash so the user can retry, and surface the error explicitly.
       log.appendLine(`[binaryPicker] refreshFromServer probe failed: ${err}`)
+      vscode.window.showErrorMessage(
+        `Shynkro: couldn't refresh server version for ${path.basename(state.localPath)}: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      if (!state.picker) this.showPicker(state)
+      return
     }
+    const newServerHash = probe.hash
+    // Empty hash means the server didn't expose X-Content-Hash on the probe
+    // response (older server, different backend). Treat like "unchanged" and
+    // re-open the picker so the user can retry — overwriting serverHash with
+    // "" would corrupt the conflict state and break subsequent If-Match pushes.
+    if (!newServerHash) {
+      log.appendLine(`[binaryPicker] refreshFromServer: empty hash from probe, keeping stale state`)
+      if (!state.picker) this.showPicker(state)
+      return
+    }
+    if (newServerHash === state.localHash) {
+      this.stateDb.setSyncedBinaryHash(state.fileId, newServerHash)
+      this.closeActive(state.fileId)
+      return
+    }
+    state.serverHash = newServerHash
+    if (state.picker) state.picker.title = this.pickerTitle(state.localPath, true)
+    else this.showPicker(state)
   }
 
   private async refreshOnServerChange(state: ConflictState, newServerHash: string): Promise<void> {

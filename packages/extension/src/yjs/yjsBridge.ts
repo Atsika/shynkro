@@ -6,7 +6,10 @@ import { WS_BINARY_YJS_UPDATE, WS_BINARY_YJS_STATE, WS_BINARY_AWARENESS } from "
 import type { CursorPayload, DocId, FileId, Role, WorkspaceId } from "@shynkro/shared"
 import type { WsManager } from "../ws/wsManager"
 import type { FileWatcher } from "../sync/fileWatcher"
-import type { RestClient } from "../api/restClient"
+import { RemoteCursorRenderer } from "./remoteCursorRenderer"
+import { ViewerRoleUi } from "./viewerRoleUi"
+import { hydrateFromLocal, maybeCompact } from "./yjsPersistence"
+import { buildBinaryFrame, editorOffsetToLfOffset, countCrInRange } from "./yjsFrames"
 import { log } from "../logger"
 import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../text/textNormalize"
 import { atomicWriteFileSync } from "../text/atomicWrite"
@@ -17,32 +20,6 @@ import { atomicWriteFileSync } from "../text/atomicWrite"
  * the per-transact size keeps frames well under the server's 50 MB safety net.
  */
 const PASTE_CHUNK_THRESHOLD = 256 * 1024
-
-/**
- * Compaction threshold: once a doc accumulates this many incremental updates
- * in `yjs_local_updates`, snapshot the current Y.Doc state and delete the
- * subsumed updates. Mirrors the server-side `COMPACTION_THRESHOLD` so local
- * and server compaction cadence match.
- */
-const LOCAL_COMPACT_THRESHOLD = 500
-
-function editorOffsetToLfOffset(editorText: string, editorOffset: number): number {
-  let crCount = 0
-  const limit = Math.min(editorOffset, editorText.length)
-  for (let i = 0; i < limit; i++) {
-    if (editorText.charCodeAt(i) === 13) crCount++
-  }
-  return editorOffset - crCount
-}
-
-function countCrInRange(editorText: string, from: number, length: number): number {
-  const end = Math.min(from + length, editorText.length)
-  let cr = 0
-  for (let i = from; i < end; i++) {
-    if (editorText.charCodeAt(i) === 13) cr++
-  }
-  return cr
-}
 
 interface DocEntry {
   yDoc: Y.Doc
@@ -63,50 +40,17 @@ interface BackgroundEntry {
   hasReceivedState: boolean
 }
 
-function uuidToBytes(uuid: string): Uint8Array {
-  const hex = uuid.replace(/-/g, "")
-  const bytes = new Uint8Array(16)
-  for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return bytes
-}
-
-function buildBinaryFrame(frameType: number, docId: string, data: Uint8Array): Uint8Array {
-  const frame = new Uint8Array(1 + 16 + data.length)
-  frame[0] = frameType
-  frame.set(uuidToBytes(docId), 1)
-  frame.set(data, 17)
-  return frame
-}
-
-const CURSOR_COLORS = [
-  "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4",
-  "#FFEAA7", "#DDA0DD", "#98D8C8", "#F7DC6F",
-]
-
-interface RemoteCursorState {
-  color: string
-  cursorDecoration: vscode.TextEditorDecorationType
-  labelAboveDecoration: vscode.TextEditorDecorationType
-  labelBelowDecoration: vscode.TextEditorDecorationType
-  selectionDecoration: vscode.TextEditorDecorationType
-  expiryTimer: ReturnType<typeof setTimeout> | null
-  activeEditor: vscode.TextEditor | null
-}
-
 export class YjsBridge {
   private readonly docs = new Map<string, DocEntry>()
   private readonly backgroundDocs = new Map<string, BackgroundEntry>()
   private readonly updateHandlers = new Map<string, (update: Uint8Array, origin: unknown) => void>()
   private readonly disposables: vscode.Disposable[] = []
   private currentRole: Role = "editor"
-  private permissionPopupShown = false
   private viewerResyncTimer: ReturnType<typeof setTimeout> | null = null
   private username = ""
-  private readonly remoteCursors = new Map<string, RemoteCursorState>()
+  private readonly cursorRenderer = new RemoteCursorRenderer()
+  private readonly viewerUi: ViewerRoleUi
   private readonly selectionTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  private readonly hiddenLabels = new Set<string>()
   private lastActiveDocId: string | null = null
   private followingUserId: string | null = null
   private lastFollowedDocId: string | null = null
@@ -116,19 +60,17 @@ export class YjsBridge {
     private readonly fileWatcher: FileWatcher,
     private readonly stateDb: import("../state/stateDb").StateDb,
     private readonly workspaceRoot: string,
-    // restClient kept for forward-compat / public-API stability.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    private readonly _restClient: RestClient,
   ) {
+    this.viewerUi = new ViewerRoleUi(wsManager, workspaceRoot)
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.handleBinaryFrame(frame)),
       vscode.workspace.onDidChangeTextDocument((e) => this.handleLocalEdit(e)),
       vscode.workspace.onDidCloseTextDocument((doc) => this.handleDocClose(doc)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (editor && this.currentRole === "viewer" && editor.document.uri.scheme === "file" && this.isWorkspacePath(editor.document.uri.fsPath)) {
+        if (editor && this.currentRole === "viewer" && editor.document.uri.scheme === "file" && this.viewerUi.isWorkspacePath(editor.document.uri.fsPath)) {
           vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
           const docEntry = [...this.docs.values()].find(e => e.editor.document === editor.document)
-          if (docEntry) this.showPermissionRequestPopup(docEntry.workspaceId)
+          if (docEntry) this.viewerUi.showPermissionRequestPopup(docEntry.workspaceId)
         }
         const newDocId = editor ? this.findDocIdForPath(editor.document.uri.fsPath) : null
         if (this.lastActiveDocId && this.lastActiveDocId !== newDocId) {
@@ -154,49 +96,12 @@ export class YjsBridge {
     )
   }
 
-  /**
-   * Hydrate a Y.Doc from local persistence: snapshot first, then every update
-   * in id order. Returns the doc with full local state pre-applied; the caller
-   * still subscribes to the server, which will Y.applyUpdate-merge the
-   * authoritative state. Yjs CRDT semantics guarantee convergence regardless
-   * of order.
-   */
   private hydrateFromLocal(docId: string): Y.Doc {
-    const yDoc = new Y.Doc()
-    const snapshot = this.stateDb.loadYjsSnapshot(docId)
-    if (snapshot) {
-      Y.applyUpdate(yDoc, snapshot, "local-restore")
-    }
-    const updates = this.stateDb.loadYjsUpdates(docId)
-    for (const u of updates) {
-      Y.applyUpdate(yDoc, u.bytes, u.origin === "remote" ? "remote" : "local-restore")
-    }
-    if (snapshot || updates.length > 0) {
-      log.appendLine(`[yjsBridge] hydrated ${docId}: snapshot=${!!snapshot} updates=${updates.length}`)
-    }
-    return yDoc
+    return hydrateFromLocal(this.stateDb, docId)
   }
 
-  /**
-   * If the doc has accumulated more than LOCAL_COMPACT_THRESHOLD incremental
-   * updates, replace them with a single snapshot of the current state. Same
-   * shape as the server's `maybeCompact`.
-   */
   private maybeCompact(docId: string, yDoc: Y.Doc): void {
-    const count = this.stateDb.yjsUpdateCount(docId)
-    if (count < LOCAL_COMPACT_THRESHOLD) return
-    try {
-      const snapshot = Y.encodeStateAsUpdate(yDoc)
-      // Find the highest update id we're collapsing — anything appended after
-      // this call (concurrent local edit during snapshot) stays in place.
-      const updates = this.stateDb.loadYjsUpdates(docId)
-      if (updates.length === 0) return
-      const highestId = updates[updates.length - 1].id
-      this.stateDb.replaceYjsSnapshot(docId, snapshot, highestId, 0)
-      log.appendLine(`[yjsBridge] compacted ${docId}: ${count} updates → snapshot ${snapshot.length} bytes`)
-    } catch (err) {
-      log.appendLine(`[yjsBridge] compaction failed for ${docId}: ${err}`)
-    }
+    maybeCompact(this.stateDb, docId, yDoc)
   }
 
   /**
@@ -242,20 +147,7 @@ export class YjsBridge {
       vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
     }
 
-    // Local edits → persist + send. Remote/restore origins only persist; no echo.
-    const handler = (update: Uint8Array, origin: unknown) => {
-      const isLocal = origin !== "remote" && origin !== "local-restore"
-      if (origin === "local-restore") return
-      // Persist every update (local + remote) so the doc can be rebuilt offline.
-      const acked = !isLocal
-      const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
-      if (isLocal) {
-        const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-        const sent = this.wsManager.sendBinary(frame)
-        if (sent) this.stateDb.markYjsUpdateAcked(id)
-      }
-      this.maybeCompact(docId, yDoc)
-    }
+    const handler = this.createUpdateHandler(docId, yDoc)
     this.updateHandlers.set(docId, handler)
     yDoc.on("update", handler)
 
@@ -274,10 +166,26 @@ export class YjsBridge {
       hasReceivedState: false,
     }
     this.backgroundDocs.set(docId, bgEntry)
-    // Background docs also persist their updates so a reload preserves state.
-    const handler = (update: Uint8Array, origin: unknown) => {
-      const isLocal = origin !== "remote" && origin !== "local-restore"
+    const handler = this.createUpdateHandler(docId, yDoc)
+    this.updateHandlers.set(docId, handler)
+    yDoc.on("update", handler)
+    this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
+  }
+
+  private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
+    return this.updateHandlers.get(docId) ?? (() => {})
+  }
+
+  /**
+   * Factory for the `yDoc.on("update")` handler. Every mount site (openDoc,
+   * subscribeBackground, handleDocClose → background) shares the same policy:
+   * persist local + remote updates, send locals over the wire, ack on send,
+   * and nudge the compactor.
+   */
+  private createUpdateHandler(docId: string, yDoc: Y.Doc): (update: Uint8Array, origin: unknown) => void {
+    return (update, origin) => {
       if (origin === "local-restore") return
+      const isLocal = origin !== "remote"
       const acked = !isLocal
       const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
       if (isLocal) {
@@ -287,13 +195,29 @@ export class YjsBridge {
       }
       this.maybeCompact(docId, yDoc)
     }
-    this.updateHandlers.set(docId, handler)
-    yDoc.on("update", handler)
-    this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
   }
 
-  private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
-    return this.updateHandlers.get(docId) ?? (() => {})
+  /**
+   * On receipt of an initial server state frame, ack any local updates the
+   * server has already absorbed, so the compactor can reclaim them. Called
+   * from both foreground and background paths — identical logic.
+   */
+  private trimAckedLocalUpdates(docId: string, frameData: Uint8Array, yDoc: Y.Doc): void {
+    try {
+      const serverProbe = new Y.Doc()
+      Y.applyUpdate(serverProbe, frameData, "remote")
+      const serverVec = Y.encodeStateVector(serverProbe)
+      serverProbe.destroy()
+      const unacked = this.stateDb.loadUnackedLocalUpdates(docId)
+      for (const u of unacked) {
+        const remaining = Y.diffUpdate(u.bytes, serverVec)
+        // diffUpdate returns a "header-only" update of length 2 when nothing remains.
+        if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
+      }
+      this.maybeCompact(docId, yDoc)
+    } catch (err) {
+      log.appendLine(`[yjsBridge] state-vector trim failed for ${docId}: ${err}`)
+    }
   }
 
   private evictStaleEntriesForPath(filePath: string, exceptDocId: string): void {
@@ -334,7 +258,7 @@ export class YjsBridge {
     const wasEditor = this.currentRole !== "viewer"
     this.currentRole = role
     if (role === "viewer") {
-      this.lockAllTrackedEditors()
+      this.viewerUi.lockAllTrackedEditors()
       if (wasEditor) {
         // Force a fresh server state so any phantom edits typed before the
         // demotion landed get discarded. CRDT will merge in unsynced locals
@@ -343,13 +267,13 @@ export class YjsBridge {
           entry.hasReceivedState = false
           this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: entry.workspaceId, docId: docId as DocId })
         }
-        this.setViewerStatusBar(true)
+        this.viewerUi.setStatusBarVisible(true)
       }
     } else {
-      this.permissionPopupShown = false
-      this.setViewerStatusBar(false)
+      this.viewerUi.resetPermissionPopup()
+      this.viewerUi.setStatusBarVisible(false)
       if (wasViewer) {
-        this.unlockAllTrackedEditors()
+        this.viewerUi.unlockAllTrackedEditors()
         for (const entry of this.docs.values()) {
           this.applyDocToEditor(entry).catch(() => {})
         }
@@ -357,74 +281,8 @@ export class YjsBridge {
     }
   }
 
-  private viewerStatusBarItem: vscode.StatusBarItem | null = null
-  private setViewerStatusBar(visible: boolean): void {
-    if (visible) {
-      if (!this.viewerStatusBarItem) {
-        this.viewerStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50)
-        this.viewerStatusBarItem.text = "$(eye) Shynkro: Viewer (read-only)"
-        this.viewerStatusBarItem.tooltip =
-          "You are a viewer in this workspace — your edits are NOT saved to the server. Request editor access from the workspace owner."
-        this.viewerStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground")
-      }
-      this.viewerStatusBarItem.show()
-    } else {
-      this.viewerStatusBarItem?.hide()
-    }
-  }
-
-  private lockAllTrackedEditors(): void {
-    const urisToLock = this.collectWorkspaceTabUris()
-    if (urisToLock.length === 0) return
-    const original = vscode.window.activeTextEditor
-    ;(async () => {
-      for (const uri of urisToLock) {
-        await vscode.window.showTextDocument(uri, { preserveFocus: false, preview: false })
-        await vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
-      }
-      if (original) {
-        await vscode.window.showTextDocument(original.document, { preserveFocus: false, preview: false })
-      }
-    })().catch(() => {})
-  }
-
   setUsername(name: string): void {
     this.username = name
-  }
-
-  private unlockAllTrackedEditors(): void {
-    const urisToUnlock = this.collectWorkspaceTabUris()
-    if (urisToUnlock.length === 0) return
-    const original = vscode.window.activeTextEditor
-    ;(async () => {
-      for (const uri of urisToUnlock) {
-        await vscode.window.showTextDocument(uri, { preserveFocus: false, preview: false })
-        await vscode.commands.executeCommand("workbench.action.files.setActiveEditorWriteableInSession")
-      }
-      if (original) {
-        await vscode.window.showTextDocument(original.document, { preserveFocus: false, preview: false })
-      }
-    })().catch(() => {})
-  }
-
-  private collectWorkspaceTabUris(): vscode.Uri[] {
-    const seen = new Set<string>()
-    const uris: vscode.Uri[] = []
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        if (!(tab.input instanceof vscode.TabInputText)) continue
-        const uri = tab.input.uri
-        if (uri.scheme === "file" && this.isWorkspacePath(uri.fsPath) && !seen.has(uri.fsPath)) {
-          seen.add(uri.fsPath)
-          uris.push(uri)
-        }
-      }
-    }
-    return uris
-  }
-
-  private isWorkspacePath(fsPath: string): boolean {
-    return fsPath === this.workspaceRoot || fsPath.startsWith(this.workspaceRoot + path.sep)
   }
 
   private findDocIdForPath(fsPath: string): string | null {
@@ -563,26 +421,8 @@ export class YjsBridge {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
         Y.applyUpdate(entry.yDoc, frame.data, "remote")
         if (isInitialState) {
-          // Server state arrived: trim acked-status of our local pending updates.
-          // Compute the server's state vector, then mark any local update whose
-          // changes are subsumed as acked. Any unsent locals we still have are
-          // either (a) already in the server's state vector → safe to ack and
-          // compact, or (b) not yet — they'll be sent on the next handler tick.
-          try {
-            const serverProbe = new Y.Doc()
-            Y.applyUpdate(serverProbe, frame.data, "remote")
-            const serverVec = Y.encodeStateVector(serverProbe)
-            serverProbe.destroy()
-            const unacked = this.stateDb.loadUnackedLocalUpdates(frame.docId)
-            for (const u of unacked) {
-              const remaining = Y.diffUpdate(u.bytes, serverVec)
-              // diffUpdate returns the "header-only" update of length 2 when nothing remains.
-              if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
-            }
-            this.maybeCompact(frame.docId, entry.yDoc)
-          } catch (err) {
-            log.appendLine(`[yjsBridge] state-vector trim failed for ${frame.docId}: ${err}`)
-          }
+          // Server state arrived: ack any local updates it already absorbed.
+          this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
           entry.hasReceivedState = true
         }
         this.applyDocToEditor(entry).catch(() => {})
@@ -614,20 +454,7 @@ export class YjsBridge {
         Y.applyUpdate(bgEntry.yDoc, frame.data, "remote")
         if (isInitialState) {
           bgEntry.hasReceivedState = true
-          try {
-            const serverProbe = new Y.Doc()
-            Y.applyUpdate(serverProbe, frame.data, "remote")
-            const serverVec = Y.encodeStateVector(serverProbe)
-            serverProbe.destroy()
-            const unacked = this.stateDb.loadUnackedLocalUpdates(frame.docId)
-            for (const u of unacked) {
-              const remaining = Y.diffUpdate(u.bytes, serverVec)
-              if (remaining.length <= 2) this.stateDb.markYjsUpdateAcked(u.id)
-            }
-            this.maybeCompact(frame.docId, bgEntry.yDoc)
-          } catch (err) {
-            log.appendLine(`[yjsBridge] bg state-vector trim failed for ${frame.docId}: ${err}`)
-          }
+          this.trimAckedLocalUpdates(frame.docId, frame.data, bgEntry.yDoc)
         }
         this.scheduleBackgroundWrite(frame.docId, bgEntry)
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
@@ -759,19 +586,7 @@ export class YjsBridge {
         hasReceivedState: entry.hasReceivedState,
       }
       this.backgroundDocs.set(docId, bgEntry)
-      // Re-attach a background handler so future updates persist + send.
-      const bgHandler = (update: Uint8Array, origin: unknown) => {
-        const isLocal = origin !== "remote" && origin !== "local-restore"
-        if (origin === "local-restore") return
-        const acked = !isLocal
-        const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
-        if (isLocal) {
-          const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-          const sent = this.wsManager.sendBinary(frame)
-          if (sent) this.stateDb.markYjsUpdateAcked(id)
-        }
-        this.maybeCompact(docId, entry.yDoc)
-      }
+      const bgHandler = this.createUpdateHandler(docId, entry.yDoc)
       this.updateHandlers.set(docId, bgHandler)
       entry.yDoc.on("update", bgHandler)
       log.appendLine(`[yjsBridge] editor closed, demoted to background: ${path.basename(entry.filePath)}`)
@@ -788,7 +603,7 @@ export class YjsBridge {
         return
       }
       if (this.currentRole === "viewer") {
-        this.showPermissionRequestPopup(entry.workspaceId)
+        this.viewerUi.showPermissionRequestPopup(entry.workspaceId)
         if (this.viewerResyncTimer) clearTimeout(this.viewerResyncTimer)
         this.viewerResyncTimer = setTimeout(() => {
           this.viewerResyncTimer = null
@@ -846,18 +661,6 @@ export class YjsBridge {
     }
   }
 
-  private showPermissionRequestPopup(workspaceId: WorkspaceId): void {
-    if (this.permissionPopupShown) return
-    this.permissionPopupShown = true
-    vscode.window.showWarningMessage(
-      "You are a viewer and cannot edit this file. Request editor access?",
-      "Request Access"
-    ).then((choice) => {
-      if (choice === "Request Access") {
-        this.wsManager.sendJson({ type: "requestPermission", workspaceId })
-      }
-    })
-  }
 
   private sendCursorUpdate(docId: string, entry: DocEntry, selection: vscode.Selection): void {
     if (!this.wsManager.connected) return
@@ -884,98 +687,9 @@ export class YjsBridge {
     this.wsManager.sendJson({ type: "awarenessUpdate", docId: docId as DocId, data })
   }
 
-  private getOrCreateCursorState(userId: string, username: string): RemoteCursorState {
-    const existing = this.remoteCursors.get(userId)
-    if (existing) return existing
-    const color = CURSOR_COLORS[this.remoteCursors.size % CURSOR_COLORS.length]
-    const cursorDecoration = vscode.window.createTextEditorDecorationType({
-      borderStyle: "solid", borderColor: color, borderWidth: "0 0 0 2px",
-    })
-    const labelAboveDecoration = vscode.window.createTextEditorDecorationType({
-      before: {
-        contentText: ` ${username} `, backgroundColor: color, color: "#ffffff",
-        fontWeight: "bold", fontStyle: "normal",
-        textDecoration: "none; position: absolute; top: -1.35em; z-index: 1; white-space: nowrap; border-radius: 3px; padding: 0 2px;",
-      },
-    })
-    const labelBelowDecoration = vscode.window.createTextEditorDecorationType({
-      before: {
-        contentText: ` ${username} `, backgroundColor: color, color: "#ffffff",
-        fontWeight: "bold", fontStyle: "normal",
-        textDecoration: "none; position: absolute; top: 1.35em; z-index: 1; white-space: nowrap; border-radius: 3px; padding: 0 2px;",
-      },
-    })
-    const selectionDecoration = vscode.window.createTextEditorDecorationType({
-      backgroundColor: color + "33",
-    })
-    const state: RemoteCursorState = {
-      color, cursorDecoration, labelAboveDecoration, labelBelowDecoration, selectionDecoration,
-      expiryTimer: null, activeEditor: null,
-    }
-    this.remoteCursors.set(userId, state)
-    return state
-  }
-
   private applyRemoteCursor(docId: string, entry: DocEntry, payload: CursorPayload): void {
-    const state = this.getOrCreateCursorState(payload.userId, payload.username)
     const liveEditor = this.findEditorForFile(entry.filePath) ?? entry.editor
-
-    if (state.expiryTimer) clearTimeout(state.expiryTimer)
-    if (payload.cursor !== null) {
-      state.expiryTimer = setTimeout(() => {
-        state.expiryTimer = null
-        if (state.activeEditor) {
-          state.activeEditor.setDecorations(state.cursorDecoration, [])
-          state.activeEditor.setDecorations(state.labelAboveDecoration, [])
-          state.activeEditor.setDecorations(state.labelBelowDecoration, [])
-          state.activeEditor.setDecorations(state.selectionDecoration, [])
-          state.activeEditor = null
-        }
-      }, 5000)
-    }
-
-    if (state.activeEditor && state.activeEditor.document.uri.fsPath !== liveEditor.document.uri.fsPath) {
-      state.activeEditor.setDecorations(state.cursorDecoration, [])
-      state.activeEditor.setDecorations(state.labelAboveDecoration, [])
-      state.activeEditor.setDecorations(state.labelBelowDecoration, [])
-      state.activeEditor.setDecorations(state.selectionDecoration, [])
-    }
-
-    if (payload.cursor === null) {
-      if (state.activeEditor) {
-        state.activeEditor.setDecorations(state.cursorDecoration, [])
-        state.activeEditor.setDecorations(state.labelAboveDecoration, [])
-        state.activeEditor.setDecorations(state.labelBelowDecoration, [])
-        state.activeEditor.setDecorations(state.selectionDecoration, [])
-        state.activeEditor = null
-      }
-      return
-    }
-
-    state.activeEditor = liveEditor
-    const cursorPos = new vscode.Position(payload.cursor.line, payload.cursor.character)
-    liveEditor.setDecorations(state.cursorDecoration, [new vscode.Range(cursorPos, cursorPos)])
-
-    if (this.hiddenLabels.has(payload.userId)) {
-      liveEditor.setDecorations(state.labelAboveDecoration, [])
-      liveEditor.setDecorations(state.labelBelowDecoration, [])
-    } else if (payload.cursor.line === 0) {
-      liveEditor.setDecorations(state.labelAboveDecoration, [])
-      liveEditor.setDecorations(state.labelBelowDecoration, [new vscode.Range(cursorPos, cursorPos)])
-    } else {
-      liveEditor.setDecorations(state.labelBelowDecoration, [])
-      liveEditor.setDecorations(state.labelAboveDecoration, [new vscode.Range(cursorPos, cursorPos)])
-    }
-
-    if (payload.selection) {
-      const selRange = new vscode.Range(
-        new vscode.Position(payload.selection.anchor.line, payload.selection.anchor.character),
-        new vscode.Position(payload.selection.active.line,  payload.selection.active.character),
-      )
-      liveEditor.setDecorations(state.selectionDecoration, [selRange])
-    } else {
-      liveEditor.setDecorations(state.selectionDecoration, [])
-    }
+    this.cursorRenderer.apply(payload, liveEditor)
     void docId
   }
 
@@ -1009,13 +723,7 @@ export class YjsBridge {
   }
 
   setLabelHidden(userId: string, hidden: boolean): void {
-    if (hidden) this.hiddenLabels.add(userId)
-    else this.hiddenLabels.delete(userId)
-    const state = this.remoteCursors.get(userId)
-    if (state?.activeEditor) {
-      state.activeEditor.setDecorations(state.labelAboveDecoration, [])
-      state.activeEditor.setDecorations(state.labelBelowDecoration, [])
-    }
+    this.cursorRenderer.setLabelHidden(userId, hidden)
   }
 
   dispose(): void {
@@ -1036,18 +744,10 @@ export class YjsBridge {
     this.updateHandlers.clear()
     for (const timer of this.selectionTimers.values()) clearTimeout(timer)
     this.selectionTimers.clear()
-    for (const state of this.remoteCursors.values()) {
-      if (state.expiryTimer) clearTimeout(state.expiryTimer)
-      state.cursorDecoration.dispose()
-      state.labelAboveDecoration.dispose()
-      state.labelBelowDecoration.dispose()
-      state.selectionDecoration.dispose()
-    }
-    this.remoteCursors.clear()
+    this.cursorRenderer.dispose()
     this.docs.clear()
     this.backgroundDocs.clear()
-    this.viewerStatusBarItem?.dispose()
-    this.viewerStatusBarItem = null
+    this.viewerUi.dispose()
     this.disposables.forEach((d) => d.dispose())
   }
 }
