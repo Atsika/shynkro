@@ -2,6 +2,7 @@ import Elysia, { status } from "elysia"
 import { eq, and, sql } from "drizzle-orm"
 import { db } from "../db/index.js"
 import { fileEntries } from "../db/schema.js"
+import { activeFileById } from "../db/predicates.js"
 import { withAuth } from "../middleware/auth.js"
 import { createStorageBackend } from "../storage/index.js"
 import { broadcastToWorkspace } from "../services/realtimeState.js"
@@ -26,7 +27,7 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     const [file] = await db
       .select()
       .from(fileEntries)
-      .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+      .where(activeFileById(params.fileId))
       .limit(1)
 
     if (!file) return status(404, { message: "File not found" })
@@ -148,7 +149,7 @@ export const blobRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files/:fi
     const [file] = await db
       .select()
       .from(fileEntries)
-      .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+      .where(activeFileById(params.fileId))
       .limit(1)
 
     if (!file) return status(404, { message: "File not found" })

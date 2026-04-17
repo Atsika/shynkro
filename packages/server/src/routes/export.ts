@@ -1,7 +1,7 @@
 import Elysia, { status } from "elysia"
-import { eq, and } from "drizzle-orm"
 import { db } from "../db/index.js"
 import { fileEntries } from "../db/schema.js"
+import { activeFilesInWorkspace } from "../db/predicates.js"
 import { withAuth } from "../middleware/auth.js"
 import { requireMember } from "../lib/authz.js"
 import { getPlainText, DocCorruptedError, DocDeletedError } from "../services/yjsService.js"
@@ -27,12 +27,7 @@ export const exportRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       const files = await db
         .select()
         .from(fileEntries)
-        .where(
-          and(
-            eq(fileEntries.workspaceId, params.id),
-            eq(fileEntries.deleted, false)
-          )
-        )
+        .where(activeFilesInWorkspace(params.id))
 
       const zipEntries: Record<string, [Uint8Array, { level: 0 }]> = {}
       let accumulated = 0

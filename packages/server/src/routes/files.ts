@@ -1,6 +1,7 @@
 import Elysia, { t, status } from "elysia"
 import { eq, and, sql } from "drizzle-orm"
 import { db } from "../db/index.js"
+import { activeFileById } from "../db/predicates.js"
 import {
   collaborativeDocs,
   fileEntries,
@@ -173,7 +174,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
     const [file] = await db
       .select()
       .from(fileEntries)
-      .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+      .where(activeFileById(params.fileId))
       .limit(1)
 
     if (!file) return status(404, { message: "File not found" })
@@ -188,7 +189,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
     const [file] = await db
       .select()
       .from(fileEntries)
-      .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+      .where(activeFileById(params.fileId))
       .limit(1)
 
     if (!file) return status(404, { message: "File not found" })
@@ -227,7 +228,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       const [file] = await db
         .select()
         .from(fileEntries)
-        .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+        .where(activeFileById(params.fileId))
         .limit(1)
 
       if (!file) return status(404, { message: "File not found" })
@@ -271,7 +272,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       const [file] = await db
         .select()
         .from(fileEntries)
-        .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+        .where(activeFileById(params.fileId))
         .limit(1)
 
       if (!file) return status(404, { message: "File not found" })
@@ -369,7 +370,7 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
     const [file] = await db
       .select()
       .from(fileEntries)
-      .where(and(eq(fileEntries.id, params.fileId), eq(fileEntries.deleted, false)))
+      .where(activeFileById(params.fileId))
       .limit(1)
 
     if (!file) return status(404, { message: "File not found" })

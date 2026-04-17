@@ -2,6 +2,7 @@ import Elysia, { t, status } from "elysia"
 import { eq, and, sql } from "drizzle-orm"
 import { db } from "../db/index.js"
 import { workspaces, workspaceMembers, fileEntries, users } from "../db/schema.js"
+import { activeFilesInWorkspace } from "../db/predicates.js"
 import { withAuth } from "../middleware/auth.js"
 import { uuid } from "../utils.js"
 import { requireMember } from "../lib/authz.js"
@@ -198,12 +199,7 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       const files = await db
         .select()
         .from(fileEntries)
-        .where(
-          and(
-            eq(fileEntries.workspaceId, params.id),
-            eq(fileEntries.deleted, false)
-          )
-        )
+        .where(activeFilesInWorkspace(params.id))
       return { files }
     }
   )
@@ -226,12 +222,7 @@ export const workspaceRoutes = new Elysia({ prefix: "/api/v1/workspaces" })
       const files = await db
         .select()
         .from(fileEntries)
-        .where(
-          and(
-            eq(fileEntries.workspaceId, params.id),
-            eq(fileEntries.deleted, false)
-          )
-        )
+        .where(activeFilesInWorkspace(params.id))
 
       return {
         revision: ws.revision,
