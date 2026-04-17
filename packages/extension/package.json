@@ -28,6 +28,7 @@
     "onCommand:shynkro.invite",
     "onView:shynkro.presenceView",
     "onView:shynkro.actionsView",
+    "onView:shynkro.conflictView",
     "onCommand:shynkro.setServerUrl"
   ],
   "main": "./out/extension.js",
@@ -108,13 +109,18 @@
       {
         "command": "shynkro.member.unfollow",
         "title": "Unfollow"
+      },
+      {
+        "command": "shynkro.resolveBinaryConflict",
+        "title": "Shynkro: Resolve Binary Conflict"
       }
     ],
     "keybindings": [],
     "menus": {
       "commandPalette": [
         { "command": "shynkro.trackFile", "when": "false" },
-        { "command": "shynkro.untrackFile", "when": "false" }
+        { "command": "shynkro.untrackFile", "when": "false" },
+        { "command": "shynkro.resolveBinaryConflict", "when": "false" }
       ],
       "explorer/context": [
         {

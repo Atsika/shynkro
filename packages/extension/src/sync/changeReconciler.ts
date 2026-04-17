@@ -55,11 +55,83 @@ export class ChangeReconciler {
     this.untrackedPaths.add(relPath)
   }
 
+  /**
+   * File IDs we initiated a delete for. Used to skip the disk `rm` when the
+   * server echoes `fileDeleted` back to us — otherwise a same-tick rm+create
+   * would delete the replacement file right after it was created. The stateDb
+   * purge still runs; only the filesystem action is suppressed.
+   */
+  private readonly locallyInitiatedDeletes = new Set<string>()
+  markLocalDelete(fileId: string): void {
+    this.locallyInitiatedDeletes.add(fileId)
+  }
+
   async reconcile(): Promise<void> {
     // E4: Prevent concurrent reconcile runs from polling + manual overlap
     if (this.reconciling) return
     this.reconciling = true
     try { await this._reconcile() } finally { this.reconciling = false }
+  }
+
+  /**
+   * Post-reconnect pass for binary files. Binaries never merge automatically;
+   * any local divergence from `syncedBinaryHash` always routes through the
+   * conflict picker so the user explicitly decides whether to push their
+   * version or discard it in favor of the server's. Nothing hits the server
+   * until they pick "Keep mine".
+   *
+   * Short-circuits only when local already matches the server (no real
+   * divergence worth asking about).
+   */
+  async rescanOfflineBinaries(): Promise<void> {
+    const files = this.stateDb.allFiles().filter((f) => f.kind === "binary")
+    for (const row of files) {
+      const localPath = safeJoin(this.workspaceRoot, row.path)
+      if (!localPath || !fs.existsSync(localPath)) continue
+      const syncedHash = row.syncedBinaryHash ?? row.binaryHash
+      if (!syncedHash) continue
+      let localHash: string
+      try {
+        localHash = await this.binarySync.computeHash(localPath)
+      } catch (err) {
+        log.appendLine(`[reconciler] rescan hash error for ${row.path}: ${err}`)
+        continue
+      }
+      if (localHash === syncedHash) continue // no offline change
+
+      log.appendLine(`[reconciler] rescan: offline change on ${row.path} (synced=${syncedHash.slice(0, 8)} local=${localHash.slice(0, 8)})`)
+
+      // Probe current server hash so the picker can show the real "theirs"
+      // state. On any probe error, default to syncedHash (which means the
+      // server either hasn't moved or we can't tell — picker still lets the
+      // user decide).
+      let serverHash = syncedHash
+      try {
+        const probe = await this.restClient.probeBlobSize(this.workspaceId, row.fileId as FileId)
+        if (probe.hash) serverHash = probe.hash
+      } catch (err) {
+        log.appendLine(`[reconciler] rescan probe error for ${row.path}: ${err}`)
+      }
+
+      // Coincidentally identical — local and server independently landed on
+      // the same bytes. No conflict; just mark synced.
+      if (serverHash === localHash) {
+        this.stateDb.setSyncedBinaryHash(row.fileId, localHash)
+        continue
+      }
+
+      // Local diverged from server. Let the picker drive the outcome — it
+      // will upload (with If-Match) if the user picks "Keep mine", or pull
+      // the server version if they pick "Take theirs".
+      this._onBinaryConflict.fire({
+        fileId: row.fileId,
+        workspaceId: this.workspaceId,
+        localPath,
+        localHash,
+        serverHash,
+        revision: this.stateDb.getRevision(this.workspaceId),
+      })
+    }
   }
 
   private async _reconcile(): Promise<void> {
@@ -222,18 +294,25 @@ export class ChangeReconciler {
     } else if (msg.kind === "binary") {
       // Register in stateDb first so binaryUpdated can find it even if download fails
       this.stateDb.upsertFile(msg.fileId, msg.path, msg.kind)
-      // Pre-seed mode if the create message carried it — binarySync.download will
-      // overwrite it with whatever the blob endpoint returns, but this keeps the
-      // record consistent in case the blob fetch fails.
       if (msg.mode !== null && msg.mode !== undefined) {
         this.stateDb.setFileMode(msg.fileId, msg.mode & 0o777)
       }
       this.setRevisionIfLive(msg)
       this._onFileTracked.fire(localPath)
-      try {
-        await this.binarySync.download(msg.fileId, localPath, this.workspaceId)
-      } catch (err) {
-        log.appendLine(`[reconciler] binarySync.download error for ${msg.path}: ${err}`)
+      // Only attempt download if the event carries a hash — the live WS
+      // broadcast path fires fileCreated before the blob upload completes, so
+      // the server would return 404 "No blob uploaded yet". The subsequent
+      // binaryUpdated event (emitted after blob upload) will trigger the
+      // download via applyBinaryUpdated. For /changes catch-up the hash is
+      // already present and we download immediately.
+      if (msg.hash) {
+        try {
+          await this.binarySync.download(msg.fileId, localPath, this.workspaceId)
+        } catch (err) {
+          log.appendLine(`[reconciler] binarySync.download error for ${msg.path}: ${err}`)
+        }
+      } else {
+        log.appendLine(`[reconciler] binary ${msg.path} created without hash yet; waiting for binaryUpdated`)
       }
     } else {
       // folder
@@ -274,14 +353,17 @@ export class ChangeReconciler {
     const localPath = safeJoin(this.workspaceRoot, msg.path)
     if (!localPath) { log.appendLine(`[reconciler] path traversal blocked: ${msg.path}`); return }
 
-    // If this path was "untracked" by the local user, the server broadcast
-    // is the echo of our own delete-from-workspace call. Skip the local rm
-    // so the user's file stays on disk as promised.
+    // Skip the local rm if:
+    //  (a) the user explicitly untracked this path — they want the disk copy
+    //      preserved, OR
+    //  (b) this is the echo of a delete we initiated locally — the user may
+    //      have created a replacement file with the same path already, and
+    //      blindly rmSync'ing would wipe it.
     const isUntrack = this.untrackedPaths.has(msg.path)
-    if (isUntrack) {
-      this.untrackedPaths.delete(msg.path)
-      log.appendLine(`[reconciler] applyDeleted: skipping local rm for untracked path ${msg.path}`)
-    }
+    if (isUntrack) this.untrackedPaths.delete(msg.path)
+    const wasLocal = this.locallyInitiatedDeletes.has(msg.fileId)
+    if (wasLocal) this.locallyInitiatedDeletes.delete(msg.fileId)
+    const skipRm = isUntrack || wasLocal
 
     this.fileWatcher.addWriteTag(localPath)
     // Signal the Yjs bridge so any open editor for this file gets torn down
@@ -289,13 +371,15 @@ export class ChangeReconciler {
     // Fire before removing the file so the bridge's lookup by path still works.
     this._onRemoteFileDeleted.fire({ absPath: localPath })
 
-    if (!isUntrack) {
+    if (!skipRm) {
       try {
         // rmSync handles files, directories (recursive), and is a no-op when force:true + path missing
         fs.rmSync(localPath, { recursive: true, force: true })
       } catch (err) {
         log.appendLine(`[reconciler] applyDeleted error for ${msg.path}: ${err}`)
       }
+    } else if (wasLocal) {
+      log.appendLine(`[reconciler] applyDeleted: skipping rm for locally-initiated delete ${msg.path}`)
     }
 
     // Hard-delete: server has confirmed the deletion, so the tombstone is no longer needed.

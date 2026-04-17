@@ -171,6 +171,14 @@ export const memberRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/members
     broadcastToWorkspace(params.id, {
       type: "memberRemoved",
       workspaceId: params.id,
+      userId: params.userId,
+    })
+
+    // Refresh presence so the remaining members' sidebars drop the removed user.
+    broadcastToWorkspace(params.id, {
+      type: "presenceUpdate",
+      workspaceId: params.id,
+      users: getWorkspacePresence(params.id),
     })
 
     return { ok: true }

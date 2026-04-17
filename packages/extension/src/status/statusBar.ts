@@ -31,6 +31,7 @@ export class StatusBar {
     this.conflictItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99)
     this.conflictItem.name = "Shynkro Conflicts"
     // Binary conflicts only — text conflicts are auto-merged by Yjs CRDT.
+    this.conflictItem.command = "shynkro.conflictView.focus"
     this.conflictItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground")
   }
 

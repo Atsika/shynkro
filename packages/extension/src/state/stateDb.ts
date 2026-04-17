@@ -275,6 +275,33 @@ export class StateDb {
     return Number(result.changes)
   }
 
+  /**
+   * Return a tombstoned row for this path, if any. Used by the file-replace
+   * detector so `rm foo && create foo` can un-tombstone the original fileId
+   * and be treated as a content replacement rather than a delete + fresh
+   * create with a new fileId.
+   */
+  getTombstoneByPath(relPath: string): FileMapRow | undefined {
+    return this.db
+      .prepare(`SELECT ${FILE_MAP_COLS} FROM file_map WHERE path = ? AND deleted = 1`)
+      .get(relPath) as FileMapRow | undefined
+  }
+
+  /** Clear the tombstone flag for a fileId so the row is active again. */
+  undeleteFile(fileId: string): void {
+    this.db
+      .prepare("UPDATE file_map SET deleted = 0, deleted_at = NULL WHERE file_id = ?")
+      .run(fileId)
+  }
+
+  /** Drop any queued delete ops for a fileId (used when reviving a tombstone). */
+  dropPendingDeleteOpsForFileId(fileId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM pending_ops WHERE op_type = 'delete' AND file_id = ?")
+      .run(fileId)
+    return Number(result.changes)
+  }
+
   isPathDeleted(relPath: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM file_map WHERE path = ? AND deleted = 1").get(relPath)
   }

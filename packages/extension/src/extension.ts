@@ -25,6 +25,7 @@ import { PresenceView, PresenceItem } from "./views/presenceView"
 import { ActionsView } from "./views/actionsView"
 import { SyncDecorationProvider } from "./views/syncDecorationProvider"
 import { BinaryConflictPicker } from "./binary/binaryConflictPicker"
+import { BinaryConflictsView } from "./views/binaryConflictsView"
 import { SHYNKRO_DIR, PROJECT_JSON, EXTENSION_VERSION } from "./constants"
 import { classifyFile, classifyFileWithContent } from "@shynkro/shared"
 import { decodeTextFile } from "./text/textNormalize"
@@ -43,6 +44,7 @@ let binarySyncInstance: BinarySync | null = null
 let syncDecoProviderInstance: SyncDecorationProvider | null = null
 let syncDecoRegistration: vscode.Disposable | null = null
 let binaryConflictPicker: BinaryConflictPicker | null = null
+let binaryConflictsView: BinaryConflictsView | null = null
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   try {
@@ -662,9 +664,13 @@ async function _startSyncInner(
   syncDecoProviderInstance = syncDecoProvider
   syncDecoRegistration = vscode.window.registerFileDecorationProvider(syncDecoProvider)
 
-  // Binary conflict picker — only resolver(s) see UI; everyone else gets the
-  // winner via silent reconcile. Picker is "live": reacts to onBinaryReconciled
-  // events for the same file and re-evaluates against the new server hash.
+  // Binary conflict tree view + picker. Divergences are persistent: dismissing
+  // the picker dialog does not clear the conflict. The user can re-open the
+  // picker via the sidebar entry or the status bar count.
+  binaryConflictsView?.dispose()
+  binaryConflictsView = new BinaryConflictsView()
+  const treeRegistration = vscode.window.registerTreeDataProvider("shynkro.conflictView", binaryConflictsView)
+
   binaryConflictPicker?.dispose()
   binaryConflictPicker = new BinaryConflictPicker(
     changeReconciler,
@@ -672,10 +678,18 @@ async function _startSyncInner(
     restClient,
     stateDb,
     syncDecoProvider,
+    binaryConflictsView,
     (n) => {
       statusBar?.setConflicts(n)
       vscode.commands.executeCommand("setContext", "shynkro.hasActiveConflict", n > 0)
     },
+  )
+
+  context.subscriptions.push(
+    treeRegistration,
+    vscode.commands.registerCommand("shynkro.resolveBinaryConflict", (fileId: string) => {
+      binaryConflictPicker?.reopenPicker(fileId)
+    }),
   )
 
   // Wire WS events
@@ -699,10 +713,14 @@ async function _startSyncInner(
   // their Yjs doc subscriptions torn down. Without this, the editor stays open
   // and every subsequent keystroke is silently dropped by the server.
   context.subscriptions.push(
-    fileWatcher.onFileDeleted(({ absPath }) => {
+    fileWatcher.onFileDeleted(({ absPath, fileId }) => {
       yjsBridge?.handleFileDeleted(absPath, { remote: false }).catch((err) =>
         log.appendLine(`[sync] handleFileDeleted (local) error: ${err}`)
       )
+      // Register the locally-initiated delete so when the server echoes
+      // fileDeleted back to us, the reconciler skips the disk rm (the user
+      // may have already replaced the file with the same path).
+      if (fileId) changeReconciler?.markLocalDelete(fileId)
       syncDecoProvider.refresh([vscode.Uri.file(absPath)])
     }),
     changeReconciler.onRemoteFileDeleted(({ absPath }) => {
@@ -805,6 +823,11 @@ async function _startSyncInner(
           if (choice === "Create New Workspace") vscode.commands.executeCommand("shynkro.init")
         })
       } else if (msg.type === "memberRemoved") {
+        // Only the user who was actually removed should tear down their sync.
+        // The broadcast goes to every workspace member, including the owner who
+        // initiated the removal — without the userId check, everyone (the owner
+        // included) would stop sync.
+        if (msg.userId !== wsManager!.userId) return
         // Try one last drain so any queued offline ops land on the server before
         // the membership is fully revoked. Whatever the server refuses (or whatever
         // fails transiently) gets serialized to a recovery JSON the user can open
@@ -920,6 +943,14 @@ async function _startSyncInner(
             }
           }
         }
+
+        // Post-connect binary sweep: catches edits made while offline whose
+        // upload attempt failed, and edits made while the WS was simply down
+        // between watcher fire and this reconnect. On divergence vs server,
+        // routes to the binary conflict picker.
+        changeReconciler?.rescanOfflineBinaries().catch((err) =>
+          log.appendLine(`[sync] rescanOfflineBinaries error: ${err}`)
+        )
       } else if (status === "disconnected") {
         changeReconciler?.stopPolling()
       }
@@ -947,6 +978,8 @@ function stopSync(): void {
   startSyncRunning = false
   binaryConflictPicker?.dispose()
   binaryConflictPicker = null
+  binaryConflictsView?.dispose()
+  binaryConflictsView = null
   syncDecoRegistration?.dispose()
   syncDecoRegistration = null
   syncDecoProviderInstance?.dispose()

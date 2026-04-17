@@ -85,6 +85,13 @@ export interface FileCreatedMessage {
   docId?: DocId
   /** POSIX mode bits & 0o777 — propagated from the uploader to all peers. */
   mode?: number | null
+  /**
+   * Binary-file hash at create time, populated by `/changes` during offline
+   * catch-up (since the underlying file entry already has a blob uploaded).
+   * For the live WS broadcast path this is absent — the receiver waits for
+   * the subsequent `binaryUpdated` event to trigger the download.
+   */
+  hash?: string
   revision: number
 }
 
@@ -158,6 +165,8 @@ export interface PermissionRequestedMessage {
 export interface MemberRemovedMessage {
   type: "memberRemoved"
   workspaceId: WorkspaceId
+  /** The user that was removed. Clients compare against their own userId. */
+  userId: string
 }
 
 export interface WorkspaceDeletedMessage {

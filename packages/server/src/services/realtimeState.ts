@@ -96,6 +96,17 @@ export function getWorkspacePresence(workspaceId: string) {
  * subscribing client; this deferred follow-up catches everyone else.
  */
 const pendingPresenceBroadcasts = new Map<string, ReturnType<typeof setTimeout>>()
+/** Last broadcast fingerprint per workspace, so the debounced follow-up skips
+ *  identical no-op broadcasts (the immediate + debounced pair was producing a
+ *  visible duplicate `presenceUpdate` log line on every subscribe/close). */
+const lastBroadcastFingerprint = new Map<string, string>()
+
+function presenceFingerprint(users: ReturnType<typeof getWorkspacePresence>): string {
+  return users
+    .map((u) => `${u.userId}:${u.role}`)
+    .sort()
+    .join("|")
+}
 
 export function debouncedPresenceBroadcast(workspaceId: string): void {
   const existing = pendingPresenceBroadcasts.get(workspaceId)
@@ -103,12 +114,18 @@ export function debouncedPresenceBroadcast(workspaceId: string): void {
 
   pendingPresenceBroadcasts.set(workspaceId, setTimeout(() => {
     pendingPresenceBroadcasts.delete(workspaceId)
-    broadcastToWorkspace(workspaceId, {
-      type: "presenceUpdate",
-      workspaceId,
-      users: getWorkspacePresence(workspaceId),
-    })
+    const users = getWorkspacePresence(workspaceId)
+    const fp = presenceFingerprint(users)
+    if (lastBroadcastFingerprint.get(workspaceId) === fp) return
+    lastBroadcastFingerprint.set(workspaceId, fp)
+    broadcastToWorkspace(workspaceId, { type: "presenceUpdate", workspaceId, users })
   }, 500))
+}
+
+/** Update the fingerprint after an immediate (non-debounced) presence broadcast,
+ *  so the trailing debounced follow-up doesn't re-broadcast identical state. */
+export function recordImmediatePresenceBroadcast(workspaceId: string): void {
+  lastBroadcastFingerprint.set(workspaceId, presenceFingerprint(getWorkspacePresence(workspaceId)))
 }
 
 export function updateClientRole(workspaceId: string, userId: string, newRole: Role): void {

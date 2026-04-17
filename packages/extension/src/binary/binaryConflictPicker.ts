@@ -8,6 +8,7 @@ import type { BinarySync } from "./binarySync"
 import type { RestClient } from "../api/restClient"
 import type { StateDb } from "../state/stateDb"
 import type { SyncDecorationProvider } from "../views/syncDecorationProvider"
+import type { BinaryConflictsView, BinaryConflictInfo } from "../views/binaryConflictsView"
 import { ApiError } from "../api/restClient"
 import { log } from "../logger"
 
@@ -15,13 +16,10 @@ interface ConflictState {
   fileId: string
   workspaceId: WorkspaceId
   localPath: string
-  /** Hash on disk at the moment we opened (or re-opened) the picker. */
   localHash: string
-  /** Hash currently on the server at the moment we opened the picker. */
   serverHash: string
-  picker: vscode.QuickPick<vscode.QuickPickItem>
-  /** Set true after the user picks something so async result handlers don't re-trigger UI on dispose. */
-  resolved: boolean
+  /** QuickPick if a picker is currently visible, null if user dismissed it. */
+  picker: vscode.QuickPick<vscode.QuickPickItem> | null
 }
 
 const ITEMS = {
@@ -31,18 +29,16 @@ const ITEMS = {
 } as const
 
 /**
- * Live binary conflict picker. Wires `ChangeReconciler.onBinaryConflict` to a
- * VS Code QuickPick. Only the user(s) whose local copy diverged see UI;
- * everyone else gets a silent download via `applyBinaryUpdated`'s default
- * branch.
+ * Binary conflict picker. Tracks divergences in `this.active` and surfaces
+ * them via the status bar count, the explorer `!` badge, and the
+ * "Sync Conflicts" sidebar view. The QuickPick dialog is a *view* of one
+ * conflict's state — dismissing the dialog does NOT remove the underlying
+ * conflict; the user must resolve it via Keep mine / Take theirs.
  *
- * Live behavior: while a picker is open, an `onBinaryReconciled` event for the
- * same fileId disposes the current picker and re-evaluates against the new
- * server state — auto-dismissing if local now matches, or re-opening with the
- * winner's version as "theirs" otherwise.
- *
- * Concurrency: "Keep mine" sends `If-Match: <opened-time serverHash>`. A 412
- * from the server means another resolver pushed first; we re-evaluate.
+ * Re-trigger points:
+ *  - `changeReconciler.onBinaryConflict` (rescan or WS live divergence)
+ *  - `shynkro.resolveBinaryConflict` command (sidebar click, status-bar click)
+ *  - `changeReconciler.onBinaryReconciled` (server moved while picker open)
  */
 export class BinaryConflictPicker implements vscode.Disposable {
   private readonly active = new Map<string, ConflictState>()
@@ -54,18 +50,17 @@ export class BinaryConflictPicker implements vscode.Disposable {
     private readonly restClient: RestClient,
     private readonly stateDb: StateDb,
     private readonly syncDeco: SyncDecorationProvider,
+    private readonly view: BinaryConflictsView,
     private readonly onConflictCountChange: (n: number) => void,
   ) {
     this.disposables.push(
       reconciler.onBinaryConflict((evt) => {
-        this.openOrRefresh(evt.fileId, evt.workspaceId, evt.localPath, evt.localHash, evt.serverHash).catch((err) => {
-          log.appendLine(`[binaryPicker] openOrRefresh error: ${err}`)
-        })
+        this.registerConflict(evt.fileId, evt.workspaceId, evt.localPath, evt.localHash, evt.serverHash)
+          .catch((err) => log.appendLine(`[binaryPicker] registerConflict error: ${err}`))
       }),
       reconciler.onBinaryReconciled((evt) => {
         const state = this.active.get(evt.fileId)
         if (!state) return
-        // Server moved while our picker was open — refresh against the new state.
         this.refreshOnServerChange(state, evt.serverHash).catch((err) => {
           log.appendLine(`[binaryPicker] refresh error: ${err}`)
         })
@@ -73,15 +68,18 @@ export class BinaryConflictPicker implements vscode.Disposable {
     )
   }
 
-  private async openOrRefresh(
+  /**
+   * Register a new conflict (or update an existing one with fresh hashes)
+   * and show the picker. Called from the reconciler's divergence events.
+   */
+  private async registerConflict(
     fileId: string,
     workspaceId: WorkspaceId,
     localPath: string,
     localHash: string,
     serverHash: string,
   ): Promise<void> {
-    // Auto-dismiss path: if local already matches the new server hash, we
-    // don't even need to ask.
+    // Coincidental match — no conflict.
     if (localHash === serverHash) {
       this.stateDb.setSyncedBinaryHash(fileId, serverHash)
       this.closeActive(fileId)
@@ -90,16 +88,47 @@ export class BinaryConflictPicker implements vscode.Disposable {
 
     const existing = this.active.get(fileId)
     if (existing) {
-      // Update the in-flight state and reopen against the new server hash.
-      existing.serverHash = serverHash
       existing.localHash = localHash
-      existing.picker.title = `Shynkro: conflict on ${path.basename(localPath)} (server moved)`
+      existing.serverHash = serverHash
+      if (existing.picker) {
+        existing.picker.title = this.pickerTitle(localPath, true)
+      }
       return
     }
 
-    const fileName = path.basename(localPath)
+    const state: ConflictState = {
+      fileId, workspaceId, localPath, localHash, serverHash, picker: null,
+    }
+    this.active.set(fileId, state)
+    this.syncDeco.setConflict(localPath, true)
+    this.refreshView()
+    this.onConflictCountChange(this.active.size)
+    this.showPicker(state)
+  }
+
+  /**
+   * Command target for sidebar + status bar re-open. Re-shows the picker for
+   * this fileId against the latest known state. Safe to call with a stale
+   * fileId — no-ops.
+   */
+  reopenPicker(fileId: string): void {
+    const state = this.active.get(fileId)
+    if (!state) return
+    if (state.picker) {
+      state.picker.show()
+      return
+    }
+    this.showPicker(state)
+  }
+
+  private pickerTitle(localPath: string, serverMoved: boolean): string {
+    const base = `Shynkro: conflict on ${path.basename(localPath)}`
+    return serverMoved ? `${base} (server moved)` : base
+  }
+
+  private showPicker(state: ConflictState): void {
     const picker = vscode.window.createQuickPick()
-    picker.title = `Shynkro: conflict on ${fileName}`
+    picker.title = this.pickerTitle(state.localPath, false)
     picker.placeholder = "Local and server both changed. Pick a resolution."
     picker.items = [
       { label: ITEMS.keepMine, description: "Upload your version, overwrite for everyone" },
@@ -107,13 +136,7 @@ export class BinaryConflictPicker implements vscode.Disposable {
       { label: ITEMS.compare, description: "Open both versions side by side" },
     ]
     picker.ignoreFocusOut = true
-
-    const state: ConflictState = {
-      fileId, workspaceId, localPath, localHash, serverHash, picker, resolved: false,
-    }
-    this.active.set(fileId, state)
-    this.syncDeco.setConflict(localPath, true)
-    this.onConflictCountChange(this.active.size)
+    state.picker = picker
 
     picker.onDidAccept(() => {
       const choice = picker.selectedItems[0]?.label
@@ -121,18 +144,16 @@ export class BinaryConflictPicker implements vscode.Disposable {
       this.handleChoice(state, choice).catch((err) => {
         log.appendLine(`[binaryPicker] handleChoice error: ${err}`)
         vscode.window.showErrorMessage(`Shynkro: conflict resolution failed: ${err instanceof Error ? err.message : String(err)}`)
-        this.closeActive(fileId)
       })
     })
 
+    // Dismiss without choice — keep the conflict tracked, just hide the
+    // dialog. Status bar and sidebar view keep showing it; user can reopen
+    // via the sidebar entry or the status bar click.
     picker.onDidHide(() => {
-      // Hide without accept = dismiss. Only clean up if not already resolved
-      // (i.e., user closed it manually).
-      if (!state.resolved) {
-        this.active.delete(fileId)
-        this.syncDeco.setConflict(localPath, false)
-        this.onConflictCountChange(this.active.size)
-      }
+      const currentPicker = state.picker
+      state.picker = null
+      currentPicker?.dispose()
     })
 
     picker.show()
@@ -141,7 +162,10 @@ export class BinaryConflictPicker implements vscode.Disposable {
   private async handleChoice(state: ConflictState, choice: string): Promise<void> {
     if (choice === ITEMS.compare) {
       await this.openCompare(state)
-      return // leave picker open
+      // Picker already hid (showTextDocument takes focus); re-show so the
+      // user can pick after comparing.
+      setTimeout(() => { if (this.active.has(state.fileId)) this.reopenPicker(state.fileId) }, 200)
+      return
     }
     if (choice === ITEMS.keepMine) {
       try {
@@ -149,15 +173,12 @@ export class BinaryConflictPicker implements vscode.Disposable {
           state.fileId as FileId,
           state.localPath,
           state.workspaceId,
-          state.serverHash, // If-Match: server hash at open time
+          state.serverHash,
         )
-        state.resolved = true
         this.closeActive(state.fileId)
       } catch (err) {
         if (err instanceof ApiError && err.status === 412) {
-          // Server moved between picker-open and our PUT — fetch the new hash
-          // and re-open the picker against it.
-          log.appendLine(`[binaryPicker] If-Match 412 for ${state.fileId} — server moved, refreshing`)
+          log.appendLine(`[binaryPicker] If-Match 412 for ${state.fileId} — re-probing`)
           await this.refreshFromServer(state)
           return
         }
@@ -167,14 +188,12 @@ export class BinaryConflictPicker implements vscode.Disposable {
     }
     if (choice === ITEMS.keepTheirs) {
       await this.binarySync.download(state.fileId as FileId, state.localPath, state.workspaceId)
-      state.resolved = true
       this.closeActive(state.fileId)
       return
     }
   }
 
   private async openCompare(state: ConflictState): Promise<void> {
-    // Stage server's blob to a temp file we can hand to vscode.diff.
     const ext = path.extname(state.localPath)
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "shynkro-conflict-"))
     const remoteTmp = path.join(tmpDir, `server-${state.serverHash.slice(0, 8)}${ext}`)
@@ -189,13 +208,10 @@ export class BinaryConflictPicker implements vscode.Disposable {
     const localUri = vscode.Uri.file(state.localPath)
     const remoteUri = vscode.Uri.file(remoteTmp)
     const fileName = path.basename(state.localPath)
-    // For text-diffable types vscode.diff renders an inline diff; for images
-    // and other binaries VS Code falls back to its built-in viewers. Either
-    // way the user sees both sides.
     await vscode.commands.executeCommand("vscode.diff", localUri, remoteUri, `Shynkro: ${fileName} (local ↔ server)`)
   }
 
-  /** Re-fetch the current server hash and decide whether to keep the picker open. */
+  /** Refetch the server hash after a 412 and decide whether to keep the picker open. */
   private async refreshFromServer(state: ConflictState): Promise<void> {
     try {
       const probe = await this.restClient.probeBlobSize(state.workspaceId, state.fileId as FileId)
@@ -206,36 +222,54 @@ export class BinaryConflictPicker implements vscode.Disposable {
         return
       }
       state.serverHash = newServerHash
-      state.picker.title = `Shynkro: conflict on ${path.basename(state.localPath)} (server moved)`
+      if (state.picker) state.picker.title = this.pickerTitle(state.localPath, true)
+      else this.showPicker(state)
     } catch (err) {
       log.appendLine(`[binaryPicker] refreshFromServer probe failed: ${err}`)
     }
   }
 
   private async refreshOnServerChange(state: ConflictState, newServerHash: string): Promise<void> {
-    if (newServerHash === state.serverHash) return // no real change
-    if (newServerHash === state.localHash) {
+    if (newServerHash === state.serverHash) return
+    // Re-read the current disk hash — the user may have replaced the local
+    // file since we captured state.localHash (e.g. re-uploaded online, which
+    // makes disk match server and resolves the conflict implicitly).
+    let currentLocalHash = state.localHash
+    try {
+      currentLocalHash = await this.binarySync.computeHash(state.localPath)
+    } catch { /* file missing — fall back to cached hash */ }
+    if (currentLocalHash === newServerHash) {
       this.stateDb.setSyncedBinaryHash(state.fileId, newServerHash)
       this.closeActive(state.fileId)
       return
     }
+    state.localHash = currentLocalHash
     state.serverHash = newServerHash
-    state.picker.title = `Shynkro: conflict on ${path.basename(state.localPath)} (server moved)`
+    if (state.picker) state.picker.title = this.pickerTitle(state.localPath, true)
   }
 
   private closeActive(fileId: string): void {
     const state = this.active.get(fileId)
     if (!state) return
-    state.resolved = true
-    state.picker.dispose()
+    state.picker?.dispose()
+    state.picker = null
     this.active.delete(fileId)
     this.syncDeco.setConflict(state.localPath, false)
+    this.refreshView()
     this.onConflictCountChange(this.active.size)
+  }
+
+  private refreshView(): void {
+    const list: BinaryConflictInfo[] = [...this.active.values()].map((s) => ({
+      fileId: s.fileId,
+      localPath: s.localPath,
+    }))
+    this.view.setConflicts(list)
   }
 
   dispose(): void {
     for (const state of this.active.values()) {
-      state.picker.dispose()
+      state.picker?.dispose()
     }
     this.active.clear()
     this.disposables.forEach((d) => d.dispose())
