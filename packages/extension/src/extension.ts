@@ -147,7 +147,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const found = findProjectConfig()
         if (found) {
           restClient.setBaseUrl(found.config.serverUrl)
-          startSync(found.config.serverUrl, restClient, context).catch(() => {})
+          startSync(found.config.serverUrl, restClient, context)
+            .catch((err) => log.appendLine(`[login] post-login startSync failed: ${err}`))
         }
       }
     }),
@@ -900,7 +901,7 @@ async function _startSyncInner(
               bridgeOrBackground(path.join(workspaceRoot, f.path))
             }
           })
-          .catch(() => {})
+          .catch((err) => log.appendLine(`[sync] drainPendingOps error: ${err}`))
           .finally(() => {
             changeReconciler?.reconcile()
               .then(() => syncDecoProviderInstance?.refresh())
@@ -915,10 +916,11 @@ async function _startSyncInner(
         restClient.listMembers(config.workspaceId).then((members) => {
           const self = members.find((m) => m.userId === wsManager!.userId)
           if (self) yjsBridge?.setRole(self.role)
-        }).catch(() => {})
+        }).catch((err) => log.appendLine(`[sync] listMembers for role failed: ${err}`))
 
         // Pass username to the bridge so it appears on remote cursor labels
-        restClient.me().then((me) => yjsBridge?.setUsername(me.username)).catch(() => {})
+        restClient.me().then((me) => yjsBridge?.setUsername(me.username))
+          .catch((err) => log.appendLine(`[sync] me() for username failed: ${err}`))
 
         if (isReconnect) {
           // On reconnect: re-subscribe docs that were already open before disconnect

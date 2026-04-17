@@ -152,7 +152,7 @@ export class YjsBridge {
     yDoc.on("update", handler)
 
     if (hasReceivedState || this.stateDb.loadYjsSnapshot(docId) !== undefined) {
-      this.applyDocToEditor(entry).catch(() => {})
+      this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
     }
   }
 
@@ -275,7 +275,7 @@ export class YjsBridge {
       if (wasViewer) {
         this.viewerUi.unlockAllTrackedEditors()
         for (const entry of this.docs.values()) {
-          this.applyDocToEditor(entry).catch(() => {})
+          this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
         }
       }
     }
@@ -405,7 +405,7 @@ export class YjsBridge {
       entry.applyingRemote++
       applyOps(entry.yDoc)
       entry.applyingRemote--
-      this.applyDocToEditor(entry).catch(() => {})
+      this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
       return
     }
     const bgEntry = this.backgroundDocs.get(docId)
@@ -425,7 +425,7 @@ export class YjsBridge {
           this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
           entry.hasReceivedState = true
         }
-        this.applyDocToEditor(entry).catch(() => {})
+        this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
         if (entry.applyingRemote > 0) {
           try {
@@ -607,7 +607,7 @@ export class YjsBridge {
         if (this.viewerResyncTimer) clearTimeout(this.viewerResyncTimer)
         this.viewerResyncTimer = setTimeout(() => {
           this.viewerResyncTimer = null
-          this.applyDocToEditor(entry).catch(() => {})
+          this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
         }, 50)
         return
       }
