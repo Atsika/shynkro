@@ -2,7 +2,7 @@
   "name": "shynkro",
   "displayName": "Shynkro",
   "description": "Real-time collaborative workspace synchronization",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "atsika",
   "license": "MIT",
   "repository": {
