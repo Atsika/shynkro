@@ -36,17 +36,33 @@ export class TextSyncEngine {
   ) {}
 
   /**
-   * Push the Y.Doc text into its editor using a minimal prefix/suffix replace,
-   * so decorations (cursors, selections) outside the changed region survive.
+   * Push the Y.Doc text into its editor using a minimal prefix/suffix replace.
    *
-   * Sets `entry.pendingEditorWrite` BEFORE `applyEdit` so the resulting
+   * Calls are serialized per doc via `entry.applyChain` — back-to-back remote
+   * frames cannot overwrite each other's `pendingEditorWrite` signature,
+   * which would otherwise cause the first frame's VS Code event to match the
+   * second frame's signature (miss), be treated as user input, and get
+   * re-inserted into Y.Doc (the duplication that produced long runs of
+   * garbage text in early collab testing).
+   *
+   * Sets `pendingEditorWrite` BEFORE `applyEdit` so the resulting
    * `onDidChangeTextDocument` event is consumed by `handleLocalEdit` rather
-   * than round-tripped into the Y.Doc as a duplicate user edit. The fence is
-   * NOT a broad "applyingRemote" counter — a real user keystroke arriving
-   * during the async `applyEdit` window is still processed into Y.Doc (the
-   * fix for D4). See {@link handleLocalEdit} for the matching logic.
+   * than round-tripped into Y.Doc. The fence is NOT a broad "applyingRemote"
+   * counter — a user keystroke arriving during the async `applyEdit` window
+   * is still processed into Y.Doc (the fix for D4).
    */
-  async applyDocToEditor(entry: DocEntry, retries = 3, onSuccess?: () => void): Promise<void> {
+  applyDocToEditor(entry: DocEntry, retries = 3, onSuccess?: () => void): Promise<void> {
+    const runThis = () => this.doApplyDocToEditor(entry, retries, onSuccess).catch((err) => {
+      log.appendLine(`[yjsBridge] applyDocToEditor rejected for ${path.basename(entry.filePath)}: ${err}`)
+    })
+    // Chain off the previous apply so two racing remote frames serialize.
+    // Use both handlers so a rejected prior link still lets this one run.
+    const next = entry.applyChain.then(runThis, runThis)
+    entry.applyChain = next
+    return next
+  }
+
+  private async doApplyDocToEditor(entry: DocEntry, retries: number, onSuccess?: () => void): Promise<void> {
     const lfText = entry.yDoc.getText("content").toString()
     const liveEditor = findEditorForFile(entry.filePath)
     if (liveEditor) entry.editor = liveEditor
@@ -90,17 +106,19 @@ export class TextSyncEngine {
     } catch (err) {
       log.appendLine(`[yjsBridge] applyDocToEditor threw for ${path.basename(entry.filePath)}: ${err}`)
       ok = false
+    } finally {
+      // Serialization via applyChain guarantees no other doApplyDocToEditor
+      // is competing for pendingEditorWrite right now; by the time applyEdit
+      // resolves, VS Code has already fired the onDidChangeTextDocument
+      // event, so handleLocalEdit has either consumed pew or it is a stale
+      // leftover to drop.
+      entry.pendingEditorWrite = null
     }
-    // Do NOT clear pendingEditorWrite here — the event fires asynchronously
-    // via VS Code's event loop. handleLocalEdit clears it on match; the
-    // expiresAt safety net covers pathological cases where the event never
-    // fires.
     if (ok) { onSuccess?.(); this.drainPendingCursor(entry) }
     else if (retries > 0) {
-      entry.pendingEditorWrite = null
-      setTimeout(() => this.applyDocToEditor(entry, retries - 1, onSuccess), 50)
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      await this.doApplyDocToEditor(entry, retries - 1, onSuccess)
     } else {
-      entry.pendingEditorWrite = null
       log.appendLine(`[yjsBridge] applyDocToEditor failed after retries for ${path.basename(entry.filePath)}`)
       onSuccess?.()
       this.drainPendingCursor(entry)

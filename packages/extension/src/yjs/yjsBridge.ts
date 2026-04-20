@@ -137,6 +137,7 @@ export class YjsBridge {
       yDoc, fileId, filePath, workspaceId, editor,
       applyingRemote: 0,
       pendingEditorWrite: null,
+      applyChain: Promise.resolve(),
       hasReceivedState,
       pendingCursor: null,
       recoveryMode: false,

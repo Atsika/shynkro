@@ -34,6 +34,13 @@ export interface DocEntry {
    */
   applyingRemote: number
   pendingEditorWrite: PendingEditorWrite | null
+  /**
+   * Serializes concurrent `applyDocToEditor` calls for this doc so back-to-back
+   * remote frames cannot overwrite each other's `pendingEditorWrite` signature.
+   * Each call chains `.then(...)` onto the previous one and reassigns this
+   * field. Initialized to `Promise.resolve()`.
+   */
+  applyChain: Promise<void>
   hasReceivedState: boolean
   pendingCursor: CursorPayload | null
   /**
