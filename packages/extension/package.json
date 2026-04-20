@@ -50,6 +50,10 @@
         "title": "Shynkro: Logout"
       },
       {
+        "command": "shynkro.exitRecovery",
+        "title": "Shynkro: Exit Recovery Mode"
+      },
+      {
         "command": "shynkro.relink",
         "title": "Shynkro: Re-link Workspace"
       },

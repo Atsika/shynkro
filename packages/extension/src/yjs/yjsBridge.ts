@@ -120,6 +120,7 @@ export class YjsBridge {
       applyingRemote: 0,
       hasReceivedState,
       pendingCursor: null,
+      recoveryMode: false,
     }
     this.registry.setDoc(docId, entry)
 
@@ -246,11 +247,37 @@ export class YjsBridge {
       )
       if (choice === "Save Local Copy") {
         const recoveredPath = `${absPath}.recovered-${Date.now()}`
+        const content = doc.getText()
+        let written = false
         try {
-          fs.writeFileSync(recoveredPath, doc.getText(), "utf-8")
-          vscode.window.showInformationMessage(`Shynkro: saved recovery copy at ${path.basename(recoveredPath)}`)
+          fs.writeFileSync(recoveredPath, content, "utf-8")
+          written = true
         } catch (err) {
-          log.appendLine(`[yjsBridge] failed to write recovery copy ${recoveredPath}: ${err}`)
+          log.appendLine(`[yjsBridge] sync recovery write failed ${recoveredPath}: ${err}`)
+          try {
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.file(recoveredPath),
+              Buffer.from(content, "utf-8"),
+            )
+            written = true
+          } catch (err2) {
+            log.appendLine(`[yjsBridge] fallback recovery write failed ${recoveredPath}: ${err2}`)
+            const keepChoice = await vscode.window.showErrorMessage(
+              `Shynkro: could not write recovery copy for "${path.basename(absPath)}" (${err2}). Keep the buffer in memory so you can retry?`,
+              { modal: true }, "Keep", "Discard",
+            )
+            if (keepChoice === "Keep") {
+              matchedEntry.recoveryMode = true
+              log.appendLine(`[yjsBridge] entered recoveryMode for ${matchedDocId}: outbound/inbound suppressed until shynkro.exitRecovery`)
+              vscode.window.showInformationMessage(
+                `Shynkro: buffer preserved. Save-As elsewhere, then run "Shynkro: Exit Recovery Mode" to resume sync.`,
+              )
+              return
+            }
+          }
+        }
+        if (written) {
+          vscode.window.showInformationMessage(`Shynkro: saved recovery copy at ${path.basename(recoveredPath)}`)
         }
       }
     }
@@ -275,6 +302,33 @@ export class YjsBridge {
 
   handleExternalTextEdit(filePath: string, docId: string): void {
     this.textSync.handleExternalTextEdit(filePath, docId)
+  }
+
+  /**
+   * Surface every doc currently held in recovery mode so the extension can
+   * offer a user-facing pick list when invoking `shynkro.exitRecovery`.
+   */
+  listRecoveryDocs(): Array<{ docId: string; filePath: string }> {
+    const out: Array<{ docId: string; filePath: string }> = []
+    for (const [docId, entry] of this.registry.docEntries()) {
+      if (entry.recoveryMode) out.push({ docId, filePath: entry.filePath })
+    }
+    return out
+  }
+
+  /**
+   * Resume normal sync on a doc that has been held in recovery mode. The
+   * caller is expected to have preserved the user's content out-of-band
+   * (Save-As, copy-paste, etc.); we tear down the local CRDT state so the
+   * next open starts from the authoritative server state.
+   */
+  exitRecoveryMode(docId: string): void {
+    const entry = this.registry.getDoc(docId as DocId)
+    if (!entry || !entry.recoveryMode) return
+    entry.recoveryMode = false
+    log.appendLine(`[yjsBridge] exitRecoveryMode ${docId}: tearing down local state`)
+    this.closeDoc(docId as DocId)
+    this.stateDb.purgeYjsForDoc(docId)
   }
 
   private handleDocClose(doc: vscode.TextDocument): void {
