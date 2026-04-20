@@ -125,9 +125,16 @@ async function processMessage(ws: any, rawMessage: unknown): Promise<void> {
 
       const frameType = buf[0]
       if (frameType === WS_BINARY_YJS_UPDATE) {
-        const h = buf.slice(1, 17).toString("hex")
-        const docId = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`
-        const update = buf.slice(17)
+        // V2 layout: [type(1)][docId(16)][clientUpdateId(16)][update(N)].
+        // The clientUpdateId is sender-private — echoed back in yjsUpdateAck
+        // once persistUpdate() commits, then stripped before rebroadcast so
+        // peers never see another client's ack correlation key.
+        if (buf.length < 34) return
+        const dh = buf.slice(1, 17).toString("hex")
+        const docId = `${dh.slice(0,8)}-${dh.slice(8,12)}-${dh.slice(12,16)}-${dh.slice(16,20)}-${dh.slice(20)}`
+        const ch = buf.slice(17, 33).toString("hex")
+        const clientUpdateId = `${ch.slice(0,8)}-${ch.slice(8,12)}-${ch.slice(12,16)}-${ch.slice(16,20)}-${ch.slice(20)}`
+        const update = buf.slice(33)
 
         // Persist BEFORE broadcasting — if persist fails, don't broadcast a phantom update
         try {
@@ -157,7 +164,19 @@ async function processMessage(ws: any, rawMessage: unknown): Promise<void> {
           logger.error("persistUpdate failed", { docId, err: String(err) })
           return
         }
-        broadcastToDoc(docId, buf, ctx)
+
+        // Durability confirmed. Echo the sender-private id so the client can
+        // retire the row from its local unacked queue. A socket death right
+        // after persist but before this send still lands in a safe state: the
+        // client resends on reconnect and the server dedupes (Yjs CRDT makes
+        // persistUpdate idempotent by clientID+clock).
+        ws.send(JSON.stringify({ type: "yjsUpdateAck", docId, clientUpdateId }))
+
+        // Rebroadcast the v1-shape frame (peers don't need the id).
+        const peerFrame = Buffer.allocUnsafe(17 + update.length)
+        buf.copy(peerFrame, 0, 0, 17)
+        update.copy(peerFrame, 17)
+        broadcastToDoc(docId, peerFrame, ctx)
         maybeCompact(docId).catch((err) => logger.error("compaction failed", { docId, err: String(err) }))
       }
       return

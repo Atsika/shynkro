@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite"
+import { randomUUID } from "node:crypto"
 import type { FileMapRow } from "../types"
 
-const SCHEMA_VERSION = 6
+const SCHEMA_VERSION = 7
 const FILE_MAP_COLS = "file_id as fileId, path, kind, doc_id as docId, binary_hash as binaryHash, synced_binary_hash as syncedBinaryHash, eol_style as eolStyle, has_bom as hasBom, mode"
 
 export class StateDb {
@@ -59,14 +60,18 @@ export class StateDb {
         updated_at   INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS yjs_local_updates (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        doc_id     TEXT NOT NULL,
-        bytes      BLOB NOT NULL,
-        origin     TEXT NOT NULL,
-        acked      INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id           TEXT NOT NULL,
+        bytes            BLOB NOT NULL,
+        origin           TEXT NOT NULL,
+        acked            INTEGER NOT NULL DEFAULT 0,
+        created_at       INTEGER NOT NULL,
+        client_update_id TEXT
       );
       CREATE INDEX IF NOT EXISTS yjs_local_updates_doc_idx ON yjs_local_updates(doc_id, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS yjs_local_updates_cuid_idx
+        ON yjs_local_updates(client_update_id)
+        WHERE client_update_id IS NOT NULL;
     `)
 
     // Apply incremental migrations for upgrades from older schemas.
@@ -109,6 +114,30 @@ export class StateDb {
       `)
       this.db.exec(`DELETE FROM pending_yjs_frames;`)
     }
+    if (currentVersion < 7) {
+      // V7: yjs_local_updates gains client_update_id so the server can ack by
+      // durable-persistence confirmation instead of the client marking rows
+      // acked on ws.send (which silently loses updates when the socket dies
+      // between client send and server persistUpdate).
+      this.addColumnIfMissing("yjs_local_updates", "client_update_id", "TEXT")
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS yjs_local_updates_cuid_idx
+          ON yjs_local_updates(client_update_id)
+          WHERE client_update_id IS NOT NULL
+      `)
+      // Backfill UUIDs for legacy unacked local rows so they can ride the
+      // new ack protocol on first reconnect after upgrade.
+      const legacy = this.db
+        .prepare(`
+          SELECT id FROM yjs_local_updates
+          WHERE origin = 'local' AND acked = 0 AND client_update_id IS NULL
+        `)
+        .all() as Array<{ id: number }>
+      const setCuid = this.db.prepare(
+        "UPDATE yjs_local_updates SET client_update_id = ? WHERE id = ?"
+      )
+      for (const row of legacy) setCuid.run(randomUUID(), row.id)
+    }
     this.setSchemaVersion(SCHEMA_VERSION)
   }
 
@@ -126,7 +155,7 @@ export class StateDb {
   // validated against a conservative whitelist pattern before interpolation —
   // ALTER TABLE does not accept bound parameters, so we must interpolate.
   private addColumnIfMissing(
-    table: "file_map" | "pending_ops",
+    table: "file_map" | "pending_ops" | "yjs_local_updates",
     column: string,
     type: string
   ): void {
@@ -365,39 +394,81 @@ export class StateDb {
     }))
   }
 
-  /** Append an update to the local store. Returns the new row id. */
-  appendYjsUpdate(docId: string, bytes: Uint8Array, origin: "local" | "remote", acked: boolean): number {
+  /**
+   * Append an update to the local store. Returns the new row id.
+   *
+   * Local updates (origin='local') MUST pass a `clientUpdateId` — it is the
+   * correlation key the server echoes back in `yjsUpdateAck` to mark the row
+   * durably persisted. Remote rows omit it.
+   */
+  appendYjsUpdate(
+    docId: string,
+    bytes: Uint8Array,
+    origin: "local" | "remote",
+    acked: boolean,
+    clientUpdateId?: string,
+  ): number {
     const result = this.db
-      .prepare("INSERT INTO yjs_local_updates (doc_id, bytes, origin, acked, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(docId, Buffer.from(bytes), origin, acked ? 1 : 0, Date.now())
+      .prepare(
+        "INSERT INTO yjs_local_updates (doc_id, bytes, origin, acked, created_at, client_update_id) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .run(
+        docId,
+        Buffer.from(bytes),
+        origin,
+        acked ? 1 : 0,
+        Date.now(),
+        clientUpdateId ?? null,
+      )
     return Number(result.lastInsertRowid)
   }
 
   /** All unacked local updates (origin='local' AND acked=0) for this doc, ordered by id. */
-  loadUnackedLocalUpdates(docId: string): Array<{ id: number; bytes: Uint8Array }> {
+  loadUnackedLocalUpdates(docId: string): Array<{ id: number; bytes: Uint8Array; clientUpdateId: string | null }> {
     const rows = this.db
-      .prepare("SELECT id, bytes FROM yjs_local_updates WHERE doc_id = ? AND origin = 'local' AND acked = 0 ORDER BY id ASC")
-      .all(docId) as Array<{ id: number; bytes: Buffer | Uint8Array }>
+      .prepare("SELECT id, bytes, client_update_id as clientUpdateId FROM yjs_local_updates WHERE doc_id = ? AND origin = 'local' AND acked = 0 ORDER BY id ASC")
+      .all(docId) as Array<{ id: number; bytes: Buffer | Uint8Array; clientUpdateId: string | null }>
     return rows.map((r) => ({
       id: r.id,
       bytes: r.bytes instanceof Buffer ? new Uint8Array(r.bytes) : r.bytes,
+      clientUpdateId: r.clientUpdateId,
     }))
   }
 
   /** All unacked local updates across every doc (used to flush on reconnect). */
-  loadAllUnackedLocalUpdates(): Array<{ id: number; docId: string; bytes: Uint8Array }> {
+  loadAllUnackedLocalUpdates(): Array<{ id: number; docId: string; bytes: Uint8Array; clientUpdateId: string | null }> {
     const rows = this.db
-      .prepare("SELECT id, doc_id as docId, bytes FROM yjs_local_updates WHERE origin = 'local' AND acked = 0 ORDER BY id ASC")
-      .all() as Array<{ id: number; docId: string; bytes: Buffer | Uint8Array }>
+      .prepare("SELECT id, doc_id as docId, bytes, client_update_id as clientUpdateId FROM yjs_local_updates WHERE origin = 'local' AND acked = 0 ORDER BY id ASC")
+      .all() as Array<{ id: number; docId: string; bytes: Buffer | Uint8Array; clientUpdateId: string | null }>
     return rows.map((r) => ({
       id: r.id,
       docId: r.docId,
       bytes: r.bytes instanceof Buffer ? new Uint8Array(r.bytes) : r.bytes,
+      clientUpdateId: r.clientUpdateId,
     }))
   }
 
   markYjsUpdateAcked(id: number): void {
     this.db.prepare("UPDATE yjs_local_updates SET acked = 1 WHERE id = ?").run(id)
+  }
+
+  /**
+   * Backfill a clientUpdateId onto a row that somehow lacks one (e.g. a
+   * pre-V7 row that escaped the migration). Used by the reconnect flush so
+   * resends always reuse the same id and the server can dedupe.
+   */
+  setYjsUpdateClientId(id: number, clientUpdateId: string): void {
+    this.db.prepare("UPDATE yjs_local_updates SET client_update_id = ? WHERE id = ? AND client_update_id IS NULL").run(clientUpdateId, id)
+  }
+
+  /**
+   * Retire a local row by its server-echoed clientUpdateId. Called when a
+   * `yjsUpdateAck` message arrives from the server. Idempotent — duplicate
+   * acks (e.g. a resend that the server had already persisted) silently
+   * no-op on an already-acked row.
+   */
+  markYjsUpdateAckedByClientId(clientUpdateId: string): void {
+    this.db.prepare("UPDATE yjs_local_updates SET acked = 1 WHERE client_update_id = ?").run(clientUpdateId)
   }
 
   /**

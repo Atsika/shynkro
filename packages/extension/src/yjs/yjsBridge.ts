@@ -47,6 +47,11 @@ export class YjsBridge {
     )
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.router.handleBinaryFrame(frame)),
+      wsManager.onServerMessage((msg) => {
+        if (msg.type === "yjsUpdateAck") {
+          this.router.handleAck(msg.docId, msg.clientUpdateId)
+        }
+      }),
       vscode.workspace.onDidChangeTextDocument((e) => this.textSync.handleLocalEdit(e)),
       vscode.workspace.onDidCloseTextDocument((doc) => this.handleDocClose(doc)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
