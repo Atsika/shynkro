@@ -44,6 +44,11 @@ export class YjsFrameRouter {
   createUpdateHandler(docId: string, yDoc: Y.Doc): (update: Uint8Array, origin: unknown) => void {
     return (update, origin) => {
       if (origin === "local-restore") return
+      const entry = this.registry.getDoc(docId)
+      // Recovery mode: the file was remotely deleted, recovery-copy write
+      // failed, and the user chose to keep the in-memory buffer. Do not
+      // persist or ship anything until the user explicitly exits recovery.
+      if (entry?.recoveryMode) return
       const isLocal = origin !== "remote"
       if (isLocal) {
         const clientUpdateId = generateClientUpdateId()
@@ -77,6 +82,9 @@ export class YjsFrameRouter {
   handleBinaryFrame(frame: { frameType: number; docId: string; data: Uint8Array }): void {
     const entry = this.registry.getDoc(frame.docId)
     if (entry) {
+      // Recovery mode: do not merge server state — the user is protecting a
+      // local-only buffer that disagrees with the server's authoritative view.
+      if (entry.recoveryMode) return
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
         // Hold the suppression flag across Y.applyUpdate and the editor

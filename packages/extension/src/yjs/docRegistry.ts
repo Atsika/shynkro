@@ -13,6 +13,14 @@ export interface DocEntry {
   applyingRemote: number
   hasReceivedState: boolean
   pendingCursor: CursorPayload | null
+  /**
+   * True when the user chose "Keep" after a recovery-copy write failed on a
+   * remote delete. While set, outbound local updates are suppressed, inbound
+   * state/update frames are ignored, and background disk writes skip —
+   * nothing ships until the user explicitly exits recovery mode via the
+   * `shynkro.exitRecovery` command.
+   */
+  recoveryMode: boolean
 }
 
 export interface BackgroundEntry {
