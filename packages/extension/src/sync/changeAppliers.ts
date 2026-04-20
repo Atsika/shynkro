@@ -93,6 +93,7 @@ export async function applyCreated(ctx: ApplierContext, msg: FileCreatedMessage)
       const encoded = encodeTextForDisk(content, eol, bom)
       ctx.fileWatcher.addWriteTag(localPath)
       atomicWriteFileSync(localPath, encoded, { encoding: "utf-8" })
+      ctx.fileWatcher.rememberInode(localPath)
       // Persist the format we just used so subsequent reads stay consistent.
       if (row && row.eolStyle === null) {
         ctx.stateDb.setTextFormat(msg.fileId, eol, bom)
@@ -129,6 +130,7 @@ export async function applyCreated(ctx: ApplierContext, msg: FileCreatedMessage)
     if (msg.hash) {
       try {
         await ctx.binarySync.download(msg.fileId, localPath, ctx.workspaceId)
+        ctx.fileWatcher.rememberInode(localPath)
       } catch (err) {
         log.appendLine(`[reconciler] binarySync.download error for ${msg.path}: ${err}`)
       }
@@ -159,6 +161,7 @@ export async function applyRenamed(ctx: ApplierContext, msg: FileRenamedMessage)
       ctx.fileWatcher.addWriteTag(newLocal)
       ctx.fileWatcher.addWriteTag(oldLocal)
       fs.renameSync(oldLocal, newLocal)
+      ctx.fileWatcher.rememberInode(newLocal)
     }
     // stateDb.renameFile is idempotent — safe to call whether or not we just moved.
     ctx.stateDb.renameFile(msg.fileId, msg.path)
@@ -264,6 +267,7 @@ export async function applyBinaryUpdated(ctx: ApplierContext, msg: BinaryUpdated
 
     // No local change → silent download.
     await ctx.binarySync.download(msg.fileId as FileId, localPath, ctx.workspaceId)
+    ctx.fileWatcher.rememberInode(localPath)
     // binarySync.download already sets syncedBinaryHash.
     ctx.emitBinaryReconciled({ fileId: msg.fileId, serverHash: msg.hash, revision: msg.revision })
     ctx.setRevisionIfLive(msg)

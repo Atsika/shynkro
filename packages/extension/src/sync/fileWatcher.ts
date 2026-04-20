@@ -29,7 +29,17 @@ export class FileWatcher {
    * cancelled and the create is treated as a content update on the existing
    * file entry instead.
    */
-  private readonly pendingDeletes = new Map<string, { timer: ReturnType<typeof setTimeout>; fileId: string; relPath: string }>()
+  private readonly pendingDeletes = new Map<string, { timer: ReturnType<typeof setTimeout>; fileId: string; relPath: string; inode: number | null }>()
+  /**
+   * Tracks the inode (`fs.Stats.ino`) of every known file on disk so
+   * `handleCreate` can detect external moves (`mv` in a terminal, drag out
+   * of the workspace and back in, etc.) by matching the new file's inode
+   * against a pending delete at a different path. `rename()` preserves the
+   * inode within a single volume on every OS Shynkro targets (macOS, Linux,
+   * Windows NTFS), and Shynkro only ever syncs within one workspace, so
+   * cross-volume concerns don't apply.
+   */
+  private readonly pathToInode = new Map<string, number>()
 
   constructor(
     private readonly workspaceRoot: string,
@@ -42,6 +52,14 @@ export class FileWatcher {
   }
 
   start(): void {
+    // Seed pathToInode from files already known to stateDb. Without this
+    // seeding, the first external move of a pre-existing file wouldn't be
+    // detected because we'd have no cached inode to compare against.
+    for (const row of this.stateDb.allFiles()) {
+      if (row.kind === "folder") continue
+      this.rememberInode(path.join(this.workspaceRoot, row.path))
+    }
+
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(this.workspaceRoot, "**/*")
     )
@@ -100,18 +118,36 @@ export class FileWatcher {
     this.addWriteTag(oldUri.fsPath)
     this.addWriteTag(newUri.fsPath)
 
+    await this.performRename(row.fileId, oldRel, newRel, oldUri.fsPath, newUri.fsPath)
+  }
+
+  /**
+   * Apply a rename to the server + stateDb. Does NOT set write tags — callers
+   * are responsible for suppressing any pending filesystem echo (handleRename
+   * sets tags because delete/create haven't fired yet; the external-move path
+   * in handleCreate skips them because the events have already been consumed).
+   */
+  private async performRename(
+    fileId: string,
+    oldRel: string,
+    newRel: string,
+    oldAbs: string,
+    newAbs: string
+  ): Promise<void> {
     if (!this.wsManager.connected) {
       // Persist the local move so reads see the new path immediately, and queue
       // the rename to replay against the server on next reconnect. The previous
       // path is encoded in `content` (re-used field) so the drain step can rebuild
       // the FileRenamedMessage payload.
-      this.stateDb.renameFile(row.fileId, newRel)
+      this.stateDb.renameFile(fileId, newRel)
       this.stateDb.enqueuePendingOp({
         opType: "rename",
         path: newRel,
-        fileId: row.fileId,
+        fileId,
         content: oldRel,
       })
+      this.pathToInode.delete(oldAbs)
+      this.rememberInode(newAbs)
       log.appendLine(`[watcher] offline — queued rename ${oldRel} → ${newRel}`)
       return
     }
@@ -119,18 +155,37 @@ export class FileWatcher {
     try {
       await this.restClient.renameFile(
         this.workspaceId,
-        row.fileId as import("@shynkro/shared").FileId,
+        fileId as import("@shynkro/shared").FileId,
         { path: newRel }
       )
-      this.stateDb.renameFile(row.fileId, newRel)
+      this.stateDb.renameFile(fileId, newRel)
+      this.pathToInode.delete(oldAbs)
+      this.rememberInode(newAbs)
       log.appendLine(`[watcher] renamed ${oldRel} → ${newRel}`)
     } catch (err) {
-      log.appendLine(`[watcher] handleRename REST error for ${oldRel} → ${newRel}: ${err}`)
+      log.appendLine(`[watcher] performRename REST error for ${oldRel} → ${newRel}: ${err}`)
       if (err instanceof ApiError && err.code === "PATH_CASE_COLLISION") {
         vscode.window.showWarningMessage(
           `Shynkro: cannot rename to "${newRel}" — ${err.message}`
         )
       }
+    }
+  }
+
+  /**
+   * Cache a file's inode for external-move detection. Safe to call multiple
+   * times; silently no-ops for missing files, directories, or filesystems
+   * that report ino=0 (some exotic virtual mounts).
+   */
+  rememberInode(absolutePath: string): void {
+    try {
+      const stat = fs.lstatSync(absolutePath)
+      if (!stat.isFile()) return
+      const ino = Number(stat.ino)
+      if (!ino) return
+      this.pathToInode.set(absolutePath, ino)
+    } catch {
+      // Path vanished or unreadable — nothing to cache.
     }
   }
 
@@ -178,6 +233,34 @@ export class FileWatcher {
         )
       }, 100)
       return
+    }
+
+    // External move detection (mv in terminal, Finder drag-and-drop across
+    // folders, etc.). VS Code does not fire onDidRenameFiles for these — only
+    // delete(old) + create(new). A same-volume rename() preserves the inode,
+    // so if this create's inode matches a pending delete's cached inode, we
+    // treat it as a rename and preserve fileId / docId / Yjs history. We stop
+    // the debounced delete before it hits the server.
+    let newInode: number | null = null
+    try {
+      const st = fs.lstatSync(uri.fsPath)
+      if (st.isFile()) {
+        const ino = Number(st.ino)
+        if (ino) newInode = ino
+      }
+    } catch {
+      // Path vanished or unreadable — no inode to match; fall through.
+    }
+    if (newInode !== null) {
+      for (const [pendingAbs, pending] of this.pendingDeletes) {
+        if (pending.inode !== null && pending.inode === newInode) {
+          clearTimeout(pending.timer)
+          this.pendingDeletes.delete(pendingAbs)
+          log.appendLine(`[watcher] external move detected: ${pending.relPath} → ${relPath} (inode ${newInode})`)
+          await this.performRename(pending.fileId, pending.relPath, relPath, pendingAbs, uri.fsPath)
+          return
+        }
+      }
     }
 
     // Skip files already known (e.g. from import) — avoids 409 on init
@@ -306,6 +389,7 @@ export class FileWatcher {
       this.stateDb.upsertFile(file.id, relPath, kind, file.docId ?? undefined)
       if (decoded) this.stateDb.setTextFormat(file.id, decoded.eol, decoded.bom)
       if (mode !== null) this.stateDb.setFileMode(file.id, mode)
+      this.rememberInode(uri.fsPath)
       log.appendLine(`[watcher] created ${relPath} id=${file.id} docId=${file.docId}`)
       if (kind === "text" && file.docId) {
         this._onTextFileRegistered.fire(uri.fsPath)
@@ -389,11 +473,17 @@ export class FileWatcher {
     const existing = this.pendingDeletes.get(uri.fsPath)
     if (existing) clearTimeout(existing.timer)
 
+    // The file is already gone from disk by the time onDidDelete fires, so we
+    // can't stat it here. Pull the inode from the cache we maintained via
+    // rememberInode on prior create/change events (and from the start-up scan).
+    const cachedInode = this.pathToInode.get(uri.fsPath) ?? null
+
     const timer = setTimeout(() => {
       this.pendingDeletes.delete(uri.fsPath)
+      this.pathToInode.delete(uri.fsPath)
       this.executeDelete(uri, row.fileId, relPath)
     }, 150)
-    this.pendingDeletes.set(uri.fsPath, { timer, fileId: row.fileId, relPath })
+    this.pendingDeletes.set(uri.fsPath, { timer, fileId: row.fileId, relPath, inode: cachedInode })
   }
 
   /** Actually run the delete after the debounce window expires. */

@@ -246,6 +246,11 @@ export class YjsBridge {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
       entry.applyingRemote = 0
       entry.hasReceivedState = false
+      // Peers cleared our cursor decoration after their 5 s inactivity timer
+      // fired during the disconnect. Re-announce so they can render it again
+      // without waiting for the next selection change.
+      const liveEditor = this.findEditorForFile(entry.filePath)
+      if (liveEditor) this.sendCursorUpdate(docId, entry, liveEditor.selection)
     }
     for (const [docId, bgEntry] of this.backgroundDocs) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: bgEntry.workspaceId, docId: docId as DocId })
@@ -402,10 +407,19 @@ export class YjsBridge {
 
     const entry = this.docs.get(docId)
     if (entry) {
+      // Hold the suppression flag across both the Y.Text mutation and the
+      // editor write-back so any keystroke that lands in this window is
+      // ignored instead of being clobbered by the stale replace ranges.
       entry.applyingRemote++
-      applyOps(entry.yDoc)
-      entry.applyingRemote--
-      this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
+      try {
+        applyOps(entry.yDoc)
+      } catch (err) {
+        entry.applyingRemote--
+        throw err
+      }
+      this.applyDocToEditor(entry)
+        .catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
+        .finally(() => { entry.applyingRemote-- })
       return
     }
     const bgEntry = this.backgroundDocs.get(docId)
@@ -419,13 +433,25 @@ export class YjsBridge {
     if (entry) {
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
-        Y.applyUpdate(entry.yDoc, frame.data, "remote")
-        if (isInitialState) {
-          // Server state arrived: ack any local updates it already absorbed.
-          this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
-          entry.hasReceivedState = true
+        // Hold the suppression flag across Y.applyUpdate and the editor
+        // write-back: a keystroke that lands between Y.applyUpdate and
+        // applyDocToEditor would otherwise be overwritten by the stale diff
+        // ranges computed against pre-keystroke text.
+        entry.applyingRemote++
+        try {
+          Y.applyUpdate(entry.yDoc, frame.data, "remote")
+          if (isInitialState) {
+            // Server state arrived: ack any local updates it already absorbed.
+            this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
+            entry.hasReceivedState = true
+          }
+        } catch (err) {
+          entry.applyingRemote--
+          throw err
         }
-        this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
+        this.applyDocToEditor(entry)
+          .catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
+          .finally(() => { entry.applyingRemote-- })
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
         if (entry.applyingRemote > 0) {
           try {
@@ -598,10 +624,6 @@ export class YjsBridge {
     for (const [, entry] of this.docs) {
       if (entry.editor.document !== e.document) continue
       if (entry.applyingRemote > 0) return
-      if (!entry.hasReceivedState && this.stateDb.loadYjsSnapshot(this.findDocIdForEntry(entry) ?? "") === undefined) {
-        // No persisted state yet AND no server state — skip (very first ever edit before any state).
-        return
-      }
       if (this.currentRole === "viewer") {
         this.viewerUi.showPermissionRequestPopup(entry.workspaceId)
         if (this.viewerResyncTimer) clearTimeout(this.viewerResyncTimer)
