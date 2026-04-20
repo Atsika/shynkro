@@ -131,12 +131,17 @@ export class YjsFrameRouter {
     if (bgEntry) {
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
+        const wasReceived = bgEntry.hasReceivedState
         Y.applyUpdate(bgEntry.yDoc, frame.data, "remote")
         if (isInitialState) {
           bgEntry.hasReceivedState = true
           this.trimAckedLocalUpdates(frame.docId, frame.data, bgEntry.yDoc)
         }
-        this.scheduleBackgroundWrite(frame.docId, bgEntry)
+        // First-ever state: drain immediately rather than waiting another 300
+        // ms tick. Any offline external-edit that raced the reconnect lands
+        // to disk as part of the same merge.
+        if (isInitialState && !wasReceived) this.flushBackgroundWrite(frame.docId, bgEntry)
+        else this.scheduleBackgroundWrite(frame.docId, bgEntry)
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
         if (this.awareness.followedUserId) {
           try {
@@ -177,23 +182,44 @@ export class YjsFrameRouter {
     if (entry.writeTimer) clearTimeout(entry.writeTimer)
     entry.writeTimer = setTimeout(() => {
       entry.writeTimer = null
-      const relPath = path.relative(this.workspaceRoot, entry.filePath).replace(/\\/g, "/")
-      const row = this.stateDb.getFileByPath(relPath)
-      if (!row) {
-        log.appendLine(`[yjsBridge] skipping background write for deleted file ${path.basename(entry.filePath)}`)
-        this.registry.deleteBackground(docId)
-        return
-      }
-      const lfText = entry.yDoc.getText("content").toString()
-      const eol = (row.eolStyle ?? defaultEol()) as "lf" | "crlf"
-      const bom = !!row.hasBom
-      const encoded = encodeTextForDisk(lfText, eol, bom)
-      try {
-        this.fileWatcher.addWriteTag(entry.filePath)
-        atomicWriteFileSync(entry.filePath, encoded, { encoding: "utf-8" })
-      } catch (err) {
-        log.appendLine(`[yjsBridge] background write error for ${path.basename(entry.filePath)}: ${err}`)
-      }
+      this.flushBackgroundWrite(docId, entry)
     }, 300)
+  }
+
+  /**
+   * Write the current Y.Doc content to disk now. Skipped when the doc has
+   * not yet received authoritative server state — we refuse to echo pre-sync
+   * content that would overwrite a concurrent external edit. Also skipped
+   * when the file row has been tombstoned (rename/delete in flight).
+   */
+  private flushBackgroundWrite(docId: string, entry: BackgroundEntry): void {
+    if (!entry.hasReceivedState) return
+    const relPath = path.relative(this.workspaceRoot, entry.filePath).replace(/\\/g, "/")
+    const row = this.stateDb.getFileByPath(relPath)
+    if (!row) {
+      log.appendLine(`[yjsBridge] skipping background write for deleted file ${path.basename(entry.filePath)}`)
+      this.registry.deleteBackground(docId)
+      return
+    }
+    const lfText = entry.yDoc.getText("content").toString()
+    const eol = (row.eolStyle ?? defaultEol()) as "lf" | "crlf"
+    const bom = !!row.hasBom
+    const encoded = encodeTextForDisk(lfText, eol, bom)
+    try {
+      this.fileWatcher.addWriteTag(entry.filePath)
+      atomicWriteFileSync(entry.filePath, encoded, { encoding: "utf-8" })
+    } catch (err) {
+      log.appendLine(`[yjsBridge] background write error for ${path.basename(entry.filePath)}: ${err}`)
+    }
+  }
+
+  /** Called by yjsBridge on WS disconnect: cancel any pending bg writes. */
+  cancelPendingBackgroundWrites(): void {
+    for (const [, bg] of this.registry.backgroundEntries()) {
+      if (bg.writeTimer) {
+        clearTimeout(bg.writeTimer)
+        bg.writeTimer = null
+      }
+    }
   }
 }
