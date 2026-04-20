@@ -109,7 +109,7 @@ export class YjsFrameRouter {
         try {
           const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
           if (payload.userId !== this.awareness.selfUserId) {
-            this.awareness.applyRemoteCursor(entry.filePath, entry.editor, payload)
+            this.awareness.applyRemoteCursor(entry.filePath, payload)
             if (this.awareness.isFollowing(payload.userId)) {
               this.awareness.applyFollowNavigation(frame.docId, entry.filePath, payload)
             }

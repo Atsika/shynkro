@@ -94,7 +94,7 @@ export class TextSyncEngine {
     if (!cursor) return
     entry.pendingCursor = null
     if (cursor.userId !== this.awareness.selfUserId) {
-      this.awareness.applyRemoteCursor(entry.filePath, entry.editor, cursor)
+      this.awareness.applyRemoteCursor(entry.filePath, cursor)
     }
   }
 
