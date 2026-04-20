@@ -48,7 +48,7 @@ export function maybeCompact(stateDb: StateDb, docId: string, yDoc: Y.Doc): void
     const updates = stateDb.loadYjsUpdates(docId)
     if (updates.length === 0) return
     const highestId = updates[updates.length - 1].id
-    stateDb.replaceYjsSnapshot(docId, snapshot, highestId, 0)
+    stateDb.replaceYjsSnapshot(docId, snapshot, highestId)
     log.appendLine(`[yjsBridge] compacted ${docId}: ${count} updates → snapshot ${snapshot.length} bytes`)
   } catch (err) {
     log.appendLine(`[yjsBridge] compaction failed for ${docId}: ${err}`)
