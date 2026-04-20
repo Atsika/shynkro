@@ -162,6 +162,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.window.showInformationMessage("Shynkro: logged out")
     }),
 
+    vscode.commands.registerCommand("shynkro.exitRecovery", async () => {
+      if (!yjsBridge) {
+        vscode.window.showInformationMessage("Shynkro: sync not running.")
+        return
+      }
+      const docs = yjsBridge.listRecoveryDocs()
+      if (docs.length === 0) {
+        vscode.window.showInformationMessage("Shynkro: no documents are in recovery mode.")
+        return
+      }
+      const pick = await vscode.window.showQuickPick(
+        docs.map((d) => ({ label: path.basename(d.filePath), description: d.filePath, docId: d.docId })),
+        { title: "Shynkro: exit recovery for which document?", placeHolder: "Select a recovered buffer to close" },
+      )
+      if (!pick) return
+      const confirm = await vscode.window.showWarningMessage(
+        `Exit recovery for "${pick.label}"? This discards the in-memory buffer. Save elsewhere first.`,
+        { modal: true }, "Exit Recovery",
+      )
+      if (confirm === "Exit Recovery") yjsBridge.exitRecoveryMode(pick.docId)
+    }),
+
     // Track / Untrack: right-click context menu on files in the explorer.
     vscode.commands.registerCommand("shynkro.trackFile", async (uri: vscode.Uri) => {
       if (!uri || !stateDb || !wsManager?.connected) {
