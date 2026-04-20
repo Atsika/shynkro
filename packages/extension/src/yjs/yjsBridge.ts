@@ -52,6 +52,12 @@ export class YjsBridge {
           this.router.handleAck(msg.docId, msg.clientUpdateId)
         }
       }),
+      wsManager.onStatusChange((s) => {
+        // Disconnect: abort any in-flight background-write timer so we don't
+        // echo pre-reconnect Y.Doc content onto disk mid-refresh. The next
+        // STATE frame after reconnect drains the write via flushBackgroundWrite.
+        if (s === "disconnected") this.router.cancelPendingBackgroundWrites()
+      }),
       vscode.workspace.onDidChangeTextDocument((e) => this.textSync.handleLocalEdit(e)),
       vscode.workspace.onDidCloseTextDocument((doc) => this.handleDocClose(doc)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -71,7 +77,10 @@ export class YjsBridge {
           if (entry.editor.document.uri.fsPath !== e.textEditor.document.uri.fsPath) continue
           entry.editor = e.textEditor
           this.lastActiveDocId = docId
-          if (entry.applyingRemote > 0) break
+          // Skip cursor broadcast while a remote write is in flight — the
+          // selection is about to move due to the programmatic edit; we'd
+          // ship a stale position to peers.
+          if (entry.applyingRemote > 0 || entry.pendingEditorWrite) break
           const existing = this.selectionTimers.get(docId)
           if (existing) clearTimeout(existing)
           this.selectionTimers.set(docId, setTimeout(() => {
@@ -100,17 +109,26 @@ export class YjsBridge {
 
     let yDoc: Y.Doc
     let hasReceivedState = false
+    let hasLocalState = false
     const bgEntry = this.registry.getBackground(docId)
 
     if (bgEntry) {
       if (bgEntry.writeTimer) clearTimeout(bgEntry.writeTimer)
       yDoc = bgEntry.yDoc
       hasReceivedState = bgEntry.hasReceivedState
+      hasLocalState = hasReceivedState
       this.registry.deleteBackground(docId)
       yDoc.off("update", this.registry.getHandler(docId))
       log.appendLine(`[yjsBridge] openDoc (migrated from background) ${path.basename(filePath)}`)
     } else {
-      yDoc = hydrateFromLocal(this.stateDb, docId)
+      const hydrated = hydrateFromLocal(this.stateDb, docId)
+      yDoc = hydrated.yDoc
+      hasLocalState = hydrated.hasLocalState
+      // Any local state (snapshot OR updates) counts as "we have meaningful
+      // CRDT content" — the editor buffer should reflect it even before the
+      // server replies. hasReceivedState conflates "server confirmed" with
+      // "safe to project Y.Doc onto editor"; seed it from local too.
+      hasReceivedState = hasLocalState
       log.appendLine(`[yjsBridge] openDoc ${path.basename(filePath)} docId=${docId}`)
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId })
     }
@@ -118,8 +136,10 @@ export class YjsBridge {
     const entry: DocEntry = {
       yDoc, fileId, filePath, workspaceId, editor,
       applyingRemote: 0,
+      pendingEditorWrite: null,
       hasReceivedState,
       pendingCursor: null,
+      recoveryMode: false,
     }
     this.registry.setDoc(docId, entry)
 
@@ -131,7 +151,12 @@ export class YjsBridge {
     this.registry.setHandler(docId, handler)
     yDoc.on("update", handler)
 
-    if (hasReceivedState || this.stateDb.loadYjsSnapshot(docId) !== undefined) {
+    // Apply whenever we have meaningful local CRDT content — not only when a
+    // snapshot exists. Update-only state is still correct state. Skip when
+    // the editor has unsaved user changes so we don't clobber an in-progress
+    // buffer (applyDocToEditor already fast-exits on text-equality, so the
+    // snapshot-only path is effectively a free no-op when text matches).
+    if (hasLocalState && !editor.document.isDirty) {
       this.textSync.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
     }
   }
@@ -140,10 +165,12 @@ export class YjsBridge {
     if (this.registry.hasDoc(docId) || this.registry.hasBackground(docId)) return
     this.registry.evictStaleEntriesForPath(filePath, docId)
     log.appendLine(`[yjsBridge] subscribeBackground ${path.basename(filePath)}`)
-    const yDoc = hydrateFromLocal(this.stateDb, docId)
+    const { yDoc, hasLocalState } = hydrateFromLocal(this.stateDb, docId)
     const bgEntry: BackgroundEntry = {
       yDoc, filePath, workspaceId, writeTimer: null,
-      hasReceivedState: false,
+      // Seed from local hydration so the first external disk edit is merged
+      // instead of being dropped behind the hasReceivedState gate.
+      hasReceivedState: hasLocalState,
     }
     this.registry.setBackground(docId, bgEntry)
     const handler = this.router.createUpdateHandler(docId, yDoc)
@@ -157,7 +184,12 @@ export class YjsBridge {
     for (const [docId, entry] of this.registry.docEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
       entry.applyingRemote = 0
-      entry.hasReceivedState = false
+      entry.pendingEditorWrite = null
+      // Do NOT reset hasReceivedState. The frame-type discriminates fresh
+      // STATE from incremental UPDATE on receipt; resetting caused external
+      // edits between reconnect and the next STATE frame to be dropped
+      // (D6/D8) and had no other purpose.
+      //
       // Peers cleared our cursor decoration after their 5 s inactivity timer
       // fired during the disconnect. Re-announce so they can render it again
       // without waiting for the next selection change.
@@ -166,7 +198,6 @@ export class YjsBridge {
     }
     for (const [docId, bgEntry] of this.registry.backgroundEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: bgEntry.workspaceId, docId: docId as DocId })
-      bgEntry.hasReceivedState = false
     }
   }
 
@@ -246,11 +277,37 @@ export class YjsBridge {
       )
       if (choice === "Save Local Copy") {
         const recoveredPath = `${absPath}.recovered-${Date.now()}`
+        const content = doc.getText()
+        let written = false
         try {
-          fs.writeFileSync(recoveredPath, doc.getText(), "utf-8")
-          vscode.window.showInformationMessage(`Shynkro: saved recovery copy at ${path.basename(recoveredPath)}`)
+          fs.writeFileSync(recoveredPath, content, "utf-8")
+          written = true
         } catch (err) {
-          log.appendLine(`[yjsBridge] failed to write recovery copy ${recoveredPath}: ${err}`)
+          log.appendLine(`[yjsBridge] sync recovery write failed ${recoveredPath}: ${err}`)
+          try {
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.file(recoveredPath),
+              Buffer.from(content, "utf-8"),
+            )
+            written = true
+          } catch (err2) {
+            log.appendLine(`[yjsBridge] fallback recovery write failed ${recoveredPath}: ${err2}`)
+            const keepChoice = await vscode.window.showErrorMessage(
+              `Shynkro: could not write recovery copy for "${path.basename(absPath)}" (${err2}). Keep the buffer in memory so you can retry?`,
+              { modal: true }, "Keep", "Discard",
+            )
+            if (keepChoice === "Keep") {
+              matchedEntry.recoveryMode = true
+              log.appendLine(`[yjsBridge] entered recoveryMode for ${matchedDocId}: outbound/inbound suppressed until shynkro.exitRecovery`)
+              vscode.window.showInformationMessage(
+                `Shynkro: buffer preserved. Save-As elsewhere, then run "Shynkro: Exit Recovery Mode" to resume sync.`,
+              )
+              return
+            }
+          }
+        }
+        if (written) {
+          vscode.window.showInformationMessage(`Shynkro: saved recovery copy at ${path.basename(recoveredPath)}`)
         }
       }
     }
@@ -275,6 +332,33 @@ export class YjsBridge {
 
   handleExternalTextEdit(filePath: string, docId: string): void {
     this.textSync.handleExternalTextEdit(filePath, docId)
+  }
+
+  /**
+   * Surface every doc currently held in recovery mode so the extension can
+   * offer a user-facing pick list when invoking `shynkro.exitRecovery`.
+   */
+  listRecoveryDocs(): Array<{ docId: string; filePath: string }> {
+    const out: Array<{ docId: string; filePath: string }> = []
+    for (const [docId, entry] of this.registry.docEntries()) {
+      if (entry.recoveryMode) out.push({ docId, filePath: entry.filePath })
+    }
+    return out
+  }
+
+  /**
+   * Resume normal sync on a doc that has been held in recovery mode. The
+   * caller is expected to have preserved the user's content out-of-band
+   * (Save-As, copy-paste, etc.); we tear down the local CRDT state so the
+   * next open starts from the authoritative server state.
+   */
+  exitRecoveryMode(docId: string): void {
+    const entry = this.registry.getDoc(docId as DocId)
+    if (!entry || !entry.recoveryMode) return
+    entry.recoveryMode = false
+    log.appendLine(`[yjsBridge] exitRecoveryMode ${docId}: tearing down local state`)
+    this.closeDoc(docId as DocId)
+    this.stateDb.purgeYjsForDoc(docId)
   }
 
   private handleDocClose(doc: vscode.TextDocument): void {

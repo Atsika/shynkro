@@ -49,9 +49,8 @@ export class AwarenessController {
     this.wsManager.sendJson({ type: "awarenessUpdate", docId: docId as DocId, data })
   }
 
-  applyRemoteCursor(filePath: string, fallbackEditor: vscode.TextEditor, payload: CursorPayload): void {
-    const liveEditor = findEditorForFile(filePath) ?? fallbackEditor
-    this.cursorRenderer.apply(payload, liveEditor)
+  applyRemoteCursor(filePath: string, payload: CursorPayload): void {
+    this.cursorRenderer.apply(payload, filePath)
   }
 
   startFollowing(userId: string): void {
