@@ -77,7 +77,10 @@ export class YjsBridge {
           if (entry.editor.document.uri.fsPath !== e.textEditor.document.uri.fsPath) continue
           entry.editor = e.textEditor
           this.lastActiveDocId = docId
-          if (entry.applyingRemote > 0) break
+          // Skip cursor broadcast while a remote write is in flight — the
+          // selection is about to move due to the programmatic edit; we'd
+          // ship a stale position to peers.
+          if (entry.applyingRemote > 0 || entry.pendingEditorWrite) break
           const existing = this.selectionTimers.get(docId)
           if (existing) clearTimeout(existing)
           this.selectionTimers.set(docId, setTimeout(() => {
@@ -133,6 +136,7 @@ export class YjsBridge {
     const entry: DocEntry = {
       yDoc, fileId, filePath, workspaceId, editor,
       applyingRemote: 0,
+      pendingEditorWrite: null,
       hasReceivedState,
       pendingCursor: null,
       recoveryMode: false,
@@ -180,6 +184,7 @@ export class YjsBridge {
     for (const [docId, entry] of this.registry.docEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
       entry.applyingRemote = 0
+      entry.pendingEditorWrite = null
       // Do NOT reset hasReceivedState. The frame-type discriminates fresh
       // STATE from incremental UPDATE on receipt; resetting caused external
       // edits between reconnect and the next STATE frame to be dropped
