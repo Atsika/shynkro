@@ -6,7 +6,7 @@ import { WS_BINARY_YJS_UPDATE, WS_BINARY_YJS_STATE, WS_BINARY_AWARENESS } from "
 import type { CursorPayload, DocId, FileId, Role, WorkspaceId } from "@shynkro/shared"
 import type { WsManager } from "../ws/wsManager"
 import type { FileWatcher } from "../sync/fileWatcher"
-import { RemoteCursorRenderer } from "./remoteCursorRenderer"
+import { AwarenessController } from "./awarenessController"
 import { ViewerRoleUi } from "./viewerRoleUi"
 import { hydrateFromLocal, maybeCompact } from "./yjsPersistence"
 import { buildBinaryFrame, editorOffsetToLfOffset, countCrInRange } from "./yjsFrames"
@@ -32,13 +32,10 @@ export class YjsBridge {
   private readonly disposables: vscode.Disposable[] = []
   private currentRole: Role = "editor"
   private viewerResyncTimer: ReturnType<typeof setTimeout> | null = null
-  private username = ""
-  private readonly cursorRenderer = new RemoteCursorRenderer()
+  private readonly awareness: AwarenessController
   private readonly viewerUi: ViewerRoleUi
   private readonly selectionTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private lastActiveDocId: string | null = null
-  private followingUserId: string | null = null
-  private lastFollowedDocId: string | null = null
 
   constructor(
     private readonly wsManager: WsManager,
@@ -46,6 +43,7 @@ export class YjsBridge {
     private readonly stateDb: import("../state/stateDb").StateDb,
     private readonly workspaceRoot: string,
   ) {
+    this.awareness = new AwarenessController(wsManager)
     this.viewerUi = new ViewerRoleUi(wsManager, workspaceRoot)
     this.disposables.push(
       wsManager.onBinaryFrame((frame) => this.handleBinaryFrame(frame)),
@@ -59,7 +57,7 @@ export class YjsBridge {
         }
         const newDocId = editor ? this.registry.findDocIdForPath(editor.document.uri.fsPath) : null
         if (this.lastActiveDocId && this.lastActiveDocId !== newDocId) {
-          this.sendCursorClear(this.lastActiveDocId)
+          this.awareness.sendCursorClear(this.lastActiveDocId)
         }
         this.lastActiveDocId = newDocId
       }),
@@ -73,7 +71,7 @@ export class YjsBridge {
           if (existing) clearTimeout(existing)
           this.selectionTimers.set(docId, setTimeout(() => {
             this.selectionTimers.delete(docId)
-            this.sendCursorUpdate(docId, entry, e.textEditor.selection)
+            this.awareness.sendCursorUpdate(docId, e.textEditor.selection)
           }, 50))
           break
         }
@@ -211,7 +209,7 @@ export class YjsBridge {
       // fired during the disconnect. Re-announce so they can render it again
       // without waiting for the next selection change.
       const liveEditor = findEditorForFile(entry.filePath)
-      if (liveEditor) this.sendCursorUpdate(docId, entry, liveEditor.selection)
+      if (liveEditor) this.awareness.sendCursorUpdate(docId, liveEditor.selection)
     }
     for (const [docId, bgEntry] of this.registry.backgroundEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: bgEntry.workspaceId, docId: docId as DocId })
@@ -248,7 +246,7 @@ export class YjsBridge {
   }
 
   setUsername(name: string): void {
-    this.username = name
+    this.awareness.setUsername(name)
   }
 
   closeDoc(docId: DocId): void {
@@ -411,16 +409,16 @@ export class YjsBridge {
         if (entry.applyingRemote > 0) {
           try {
             const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
-            if (payload.userId !== this.wsManager.userId) entry.pendingCursor = payload
+            if (payload.userId !== this.awareness.selfUserId) entry.pendingCursor = payload
           } catch {}
           return
         }
         try {
           const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
-          if (payload.userId !== this.wsManager.userId) {
-            this.applyRemoteCursor(frame.docId, entry, payload)
-            if (payload.userId === this.followingUserId) {
-              this.applyFollowNavigation(frame.docId, entry.filePath, payload)
+          if (payload.userId !== this.awareness.selfUserId) {
+            this.awareness.applyRemoteCursor(entry.filePath, entry.editor, payload)
+            if (this.awareness.isFollowing(payload.userId)) {
+              this.awareness.applyFollowNavigation(frame.docId, entry.filePath, payload)
             }
           }
         } catch {}
@@ -439,11 +437,11 @@ export class YjsBridge {
         }
         this.scheduleBackgroundWrite(frame.docId, bgEntry)
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
-        if (this.followingUserId) {
+        if (this.awareness.followedUserId) {
           try {
             const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
-            if (payload.userId === this.followingUserId) {
-              this.applyFollowNavigation(frame.docId, bgEntry.filePath, payload)
+            if (this.awareness.isFollowing(payload.userId)) {
+              this.awareness.applyFollowNavigation(frame.docId, bgEntry.filePath, payload)
             }
           } catch {}
         }
@@ -533,16 +531,15 @@ export class YjsBridge {
     const cursor = entry.pendingCursor
     if (!cursor) return
     entry.pendingCursor = null
-    const docId = this.registry.findDocIdForEntry(entry)
-    if (docId && cursor.userId !== this.wsManager.userId) {
-      this.applyRemoteCursor(docId, entry, cursor)
+    if (cursor.userId !== this.awareness.selfUserId) {
+      this.awareness.applyRemoteCursor(entry.filePath, entry.editor, cursor)
     }
   }
 
   private handleDocClose(doc: vscode.TextDocument): void {
     for (const [docId, entry] of this.registry.docEntries()) {
       if (entry.editor.document !== doc) continue
-      this.sendCursorClear(docId)
+      this.awareness.sendCursorClear(docId)
       const handler = this.registry.getHandler(docId)
       entry.yDoc.off("update", handler)
       this.registry.deleteHandler(docId)
@@ -627,69 +624,10 @@ export class YjsBridge {
   }
 
 
-  private sendCursorUpdate(docId: string, entry: DocEntry, selection: vscode.Selection): void {
-    if (!this.wsManager.connected) return
-    const payload: CursorPayload = {
-      userId: this.wsManager.userId,
-      username: this.username,
-      cursor: { line: selection.active.line, character: selection.active.character },
-      selection: selection.isEmpty ? null : {
-        anchor: { line: selection.anchor.line, character: selection.anchor.character },
-        active:  { line: selection.active.line, character: selection.active.character },
-      },
-    }
-    const data = Buffer.from(JSON.stringify(payload)).toString("base64")
-    this.wsManager.sendJson({ type: "awarenessUpdate", docId: docId as DocId, data })
-    void entry
-  }
-
-  private sendCursorClear(docId: string): void {
-    if (!this.wsManager.connected) return
-    const payload: CursorPayload = {
-      userId: this.wsManager.userId, username: this.username, cursor: null, selection: null,
-    }
-    const data = Buffer.from(JSON.stringify(payload)).toString("base64")
-    this.wsManager.sendJson({ type: "awarenessUpdate", docId: docId as DocId, data })
-  }
-
-  private applyRemoteCursor(docId: string, entry: DocEntry, payload: CursorPayload): void {
-    const liveEditor = findEditorForFile(entry.filePath) ?? entry.editor
-    this.cursorRenderer.apply(payload, liveEditor)
-    void docId
-  }
-
-  startFollowing(userId: string): void {
-    this.followingUserId = userId
-    this.lastFollowedDocId = null
-  }
-
-  stopFollowing(): void {
-    this.followingUserId = null
-    this.lastFollowedDocId = null
-  }
-
-  get followedUserId(): string | null { return this.followingUserId }
-
-  private applyFollowNavigation(docId: string, filePath: string, payload: CursorPayload): void {
-    if (!payload.cursor) return
-    const pos = new vscode.Position(payload.cursor.line, payload.cursor.character)
-    const range = new vscode.Range(pos, pos)
-    if (docId !== this.lastFollowedDocId) {
-      this.lastFollowedDocId = docId
-      ;(async () => {
-        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath))
-        const editor = await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active })
-        editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport)
-      })().catch(() => {})
-    } else {
-      const editor = findEditorForFile(filePath)
-      if (editor) editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport)
-    }
-  }
-
-  setLabelHidden(userId: string, hidden: boolean): void {
-    this.cursorRenderer.setLabelHidden(userId, hidden)
-  }
+  startFollowing(userId: string): void { this.awareness.startFollowing(userId) }
+  stopFollowing(): void { this.awareness.stopFollowing() }
+  get followedUserId(): string | null { return this.awareness.followedUserId }
+  setLabelHidden(userId: string, hidden: boolean): void { this.awareness.setLabelHidden(userId, hidden) }
 
   dispose(): void {
     if (this.viewerResyncTimer) { clearTimeout(this.viewerResyncTimer); this.viewerResyncTimer = null }
@@ -708,7 +646,7 @@ export class YjsBridge {
     }
     for (const timer of this.selectionTimers.values()) clearTimeout(timer)
     this.selectionTimers.clear()
-    this.cursorRenderer.dispose()
+    this.awareness.dispose()
     this.registry.clear()
     this.viewerUi.dispose()
     this.disposables.forEach((d) => d.dispose())
