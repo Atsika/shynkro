@@ -10,6 +10,12 @@ import { RemoteCursorRenderer } from "./remoteCursorRenderer"
 import { ViewerRoleUi } from "./viewerRoleUi"
 import { hydrateFromLocal, maybeCompact } from "./yjsPersistence"
 import { buildBinaryFrame, editorOffsetToLfOffset, countCrInRange } from "./yjsFrames"
+import {
+  DocRegistry,
+  findEditorForFile,
+  type DocEntry,
+  type BackgroundEntry,
+} from "./docRegistry"
 import { log } from "../logger"
 import { decodeTextFile, encodeTextForDisk, defaultEol, toLf, fromLf } from "../text/textNormalize"
 import { atomicWriteFileSync } from "../text/atomicWrite"
@@ -21,29 +27,8 @@ import { atomicWriteFileSync } from "../text/atomicWrite"
  */
 const PASTE_CHUNK_THRESHOLD = 256 * 1024
 
-interface DocEntry {
-  yDoc: Y.Doc
-  fileId: FileId
-  filePath: string
-  workspaceId: WorkspaceId
-  editor: vscode.TextEditor
-  applyingRemote: number
-  hasReceivedState: boolean
-  pendingCursor: CursorPayload | null
-}
-
-interface BackgroundEntry {
-  yDoc: Y.Doc
-  filePath: string
-  workspaceId: WorkspaceId
-  writeTimer: ReturnType<typeof setTimeout> | null
-  hasReceivedState: boolean
-}
-
 export class YjsBridge {
-  private readonly docs = new Map<string, DocEntry>()
-  private readonly backgroundDocs = new Map<string, BackgroundEntry>()
-  private readonly updateHandlers = new Map<string, (update: Uint8Array, origin: unknown) => void>()
+  private readonly registry = new DocRegistry()
   private readonly disposables: vscode.Disposable[] = []
   private currentRole: Role = "editor"
   private viewerResyncTimer: ReturnType<typeof setTimeout> | null = null
@@ -69,17 +54,17 @@ export class YjsBridge {
       vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (editor && this.currentRole === "viewer" && editor.document.uri.scheme === "file" && this.viewerUi.isWorkspacePath(editor.document.uri.fsPath)) {
           vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
-          const docEntry = [...this.docs.values()].find(e => e.editor.document === editor.document)
+          const docEntry = [...this.registry.docValues()].find(e => e.editor.document === editor.document)
           if (docEntry) this.viewerUi.showPermissionRequestPopup(docEntry.workspaceId)
         }
-        const newDocId = editor ? this.findDocIdForPath(editor.document.uri.fsPath) : null
+        const newDocId = editor ? this.registry.findDocIdForPath(editor.document.uri.fsPath) : null
         if (this.lastActiveDocId && this.lastActiveDocId !== newDocId) {
           this.sendCursorClear(this.lastActiveDocId)
         }
         this.lastActiveDocId = newDocId
       }),
       vscode.window.onDidChangeTextEditorSelection((e) => {
-        for (const [docId, entry] of this.docs) {
+        for (const [docId, entry] of this.registry.docEntries()) {
           if (entry.editor.document.uri.fsPath !== e.textEditor.document.uri.fsPath) continue
           entry.editor = e.textEditor
           this.lastActiveDocId = docId
@@ -110,24 +95,24 @@ export class YjsBridge {
    * persistence so the doc is immediately usable even before the WS responds.
    */
   openDoc(fileId: FileId, docId: DocId, workspaceId: WorkspaceId, filePath: string, editor: vscode.TextEditor): void {
-    const existing = this.docs.get(docId)
+    const existing = this.registry.getDoc(docId)
     if (existing) {
       existing.editor = editor
       return
     }
 
-    this.evictStaleEntriesForPath(filePath, docId)
+    this.registry.evictStaleEntriesForPath(filePath, docId)
 
     let yDoc: Y.Doc
     let hasReceivedState = false
-    const bgEntry = this.backgroundDocs.get(docId)
+    const bgEntry = this.registry.getBackground(docId)
 
     if (bgEntry) {
       if (bgEntry.writeTimer) clearTimeout(bgEntry.writeTimer)
       yDoc = bgEntry.yDoc
       hasReceivedState = bgEntry.hasReceivedState
-      this.backgroundDocs.delete(docId)
-      yDoc.off("update", this.getUpdateHandler(docId))
+      this.registry.deleteBackground(docId)
+      yDoc.off("update", this.registry.getHandler(docId))
       log.appendLine(`[yjsBridge] openDoc (migrated from background) ${path.basename(filePath)}`)
     } else {
       yDoc = this.hydrateFromLocal(docId)
@@ -141,14 +126,14 @@ export class YjsBridge {
       hasReceivedState,
       pendingCursor: null,
     }
-    this.docs.set(docId, entry)
+    this.registry.setDoc(docId, entry)
 
     if (this.currentRole === "viewer") {
       vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession")
     }
 
     const handler = this.createUpdateHandler(docId, yDoc)
-    this.updateHandlers.set(docId, handler)
+    this.registry.setHandler(docId, handler)
     yDoc.on("update", handler)
 
     if (hasReceivedState || this.stateDb.loadYjsSnapshot(docId) !== undefined) {
@@ -157,23 +142,19 @@ export class YjsBridge {
   }
 
   subscribeBackground(docId: string, workspaceId: WorkspaceId, filePath: string): void {
-    if (this.docs.has(docId) || this.backgroundDocs.has(docId)) return
-    this.evictStaleEntriesForPath(filePath, docId)
+    if (this.registry.hasDoc(docId) || this.registry.hasBackground(docId)) return
+    this.registry.evictStaleEntriesForPath(filePath, docId)
     log.appendLine(`[yjsBridge] subscribeBackground ${path.basename(filePath)}`)
     const yDoc = this.hydrateFromLocal(docId)
     const bgEntry: BackgroundEntry = {
       yDoc, filePath, workspaceId, writeTimer: null,
       hasReceivedState: false,
     }
-    this.backgroundDocs.set(docId, bgEntry)
+    this.registry.setBackground(docId, bgEntry)
     const handler = this.createUpdateHandler(docId, yDoc)
-    this.updateHandlers.set(docId, handler)
+    this.registry.setHandler(docId, handler)
     yDoc.on("update", handler)
     this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
-  }
-
-  private getUpdateHandler(docId: string): (update: Uint8Array, origin: unknown) => void {
-    return this.updateHandlers.get(docId) ?? (() => {})
   }
 
   /**
@@ -220,39 +201,19 @@ export class YjsBridge {
     }
   }
 
-  private evictStaleEntriesForPath(filePath: string, exceptDocId: string): void {
-    for (const [oldDocId, oldEntry] of this.docs) {
-      if (oldEntry.filePath !== filePath || oldDocId === exceptDocId) continue
-      log.appendLine(`[yjsBridge] evicting stale doc entry ${oldDocId} for ${path.basename(filePath)}`)
-      const h = this.updateHandlers.get(oldDocId)
-      if (h) { oldEntry.yDoc.off("update", h); this.updateHandlers.delete(oldDocId) }
-      oldEntry.yDoc.destroy()
-      this.docs.delete(oldDocId)
-    }
-    for (const [oldDocId, oldBg] of this.backgroundDocs) {
-      if (oldBg.filePath !== filePath || oldDocId === exceptDocId) continue
-      log.appendLine(`[yjsBridge] evicting stale background entry ${oldDocId} for ${path.basename(filePath)}`)
-      if (oldBg.writeTimer) clearTimeout(oldBg.writeTimer)
-      const h = this.updateHandlers.get(oldDocId)
-      if (h) { oldBg.yDoc.off("update", h); this.updateHandlers.delete(oldDocId) }
-      oldBg.yDoc.destroy()
-      this.backgroundDocs.delete(oldDocId)
-    }
-  }
-
   /** Re-subscribe all open + background docs after a reconnect. */
   notifyConnected(workspaceId: WorkspaceId): void {
-    for (const [docId, entry] of this.docs) {
+    for (const [docId, entry] of this.registry.docEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId, docId: docId as DocId })
       entry.applyingRemote = 0
       entry.hasReceivedState = false
       // Peers cleared our cursor decoration after their 5 s inactivity timer
       // fired during the disconnect. Re-announce so they can render it again
       // without waiting for the next selection change.
-      const liveEditor = this.findEditorForFile(entry.filePath)
+      const liveEditor = findEditorForFile(entry.filePath)
       if (liveEditor) this.sendCursorUpdate(docId, entry, liveEditor.selection)
     }
-    for (const [docId, bgEntry] of this.backgroundDocs) {
+    for (const [docId, bgEntry] of this.registry.backgroundEntries()) {
       this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: bgEntry.workspaceId, docId: docId as DocId })
       bgEntry.hasReceivedState = false
     }
@@ -268,7 +229,7 @@ export class YjsBridge {
         // Force a fresh server state so any phantom edits typed before the
         // demotion landed get discarded. CRDT will merge in unsynced locals
         // that the server already applied.
-        for (const [docId, entry] of this.docs) {
+        for (const [docId, entry] of this.registry.docEntries()) {
           entry.hasReceivedState = false
           this.wsManager.sendJson({ type: "subscribeDoc", workspaceId: entry.workspaceId, docId: docId as DocId })
         }
@@ -279,7 +240,7 @@ export class YjsBridge {
       this.viewerUi.setStatusBarVisible(false)
       if (wasViewer) {
         this.viewerUi.unlockAllTrackedEditors()
-        for (const entry of this.docs.values()) {
+        for (const entry of this.registry.docValues()) {
           this.applyDocToEditor(entry).catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
         }
       }
@@ -290,37 +251,31 @@ export class YjsBridge {
     this.username = name
   }
 
-  private findDocIdForPath(fsPath: string): string | null {
-    for (const [docId, entry] of this.docs) {
-      if (entry.filePath === fsPath) return docId
-    }
-    return null
-  }
-
   closeDoc(docId: DocId): void {
-    const entry = this.docs.get(docId)
+    const entry = this.registry.getDoc(docId)
     if (!entry) return
     this.wsManager.sendJson({ type: "unsubscribeDoc", docId })
     entry.yDoc.destroy()
-    this.docs.delete(docId)
-    this.updateHandlers.delete(docId)
+    this.registry.deleteDoc(docId)
+    this.registry.deleteHandler(docId)
   }
 
   async handleFileDeleted(absPath: string, opts: { remote: boolean; deletedBy?: string }): Promise<void> {
     let matchedDocId: string | null = null
     let matchedEntry: DocEntry | null = null
-    for (const [docId, entry] of this.docs) {
+    for (const [docId, entry] of this.registry.docEntries()) {
       if (entry.filePath === absPath) { matchedDocId = docId; matchedEntry = entry; break }
     }
     if (!matchedDocId) {
-      for (const [docId, bg] of this.backgroundDocs) {
+      for (const [docId, bg] of this.registry.backgroundEntries()) {
         if (bg.filePath === absPath) {
           if (bg.writeTimer) clearTimeout(bg.writeTimer)
           this.wsManager.sendJson({ type: "unsubscribeDoc", docId: docId as DocId })
-          const h = this.updateHandlers.get(docId)
-          if (h) { bg.yDoc.off("update", h); this.updateHandlers.delete(docId) }
+          const h = this.registry.getHandler(docId)
+          bg.yDoc.off("update", h)
+          this.registry.deleteHandler(docId)
           bg.yDoc.destroy()
-          this.backgroundDocs.delete(docId)
+          this.registry.deleteBackground(docId)
           this.stateDb.purgeYjsForDoc(docId)
           log.appendLine(`[yjsBridge] closed background doc for deleted file ${path.basename(absPath)}`)
           return
@@ -405,7 +360,7 @@ export class YjsBridge {
       })
     }
 
-    const entry = this.docs.get(docId)
+    const entry = this.registry.getDoc(docId)
     if (entry) {
       // Hold the suppression flag across both the Y.Text mutation and the
       // editor write-back so any keystroke that lands in this window is
@@ -422,14 +377,14 @@ export class YjsBridge {
         .finally(() => { entry.applyingRemote-- })
       return
     }
-    const bgEntry = this.backgroundDocs.get(docId)
+    const bgEntry = this.registry.getBackground(docId)
     if (bgEntry && bgEntry.hasReceivedState) {
       applyOps(bgEntry.yDoc)
     }
   }
 
   private handleBinaryFrame(frame: { frameType: number; docId: string; data: Uint8Array }): void {
-    const entry = this.docs.get(frame.docId)
+    const entry = this.registry.getDoc(frame.docId)
     if (entry) {
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
@@ -473,7 +428,7 @@ export class YjsBridge {
       return
     }
 
-    const bgEntry = this.backgroundDocs.get(frame.docId)
+    const bgEntry = this.registry.getBackground(frame.docId)
     if (bgEntry) {
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
@@ -504,7 +459,7 @@ export class YjsBridge {
       const row = this.stateDb.getFileByPath(relPath)
       if (!row) {
         log.appendLine(`[yjsBridge] skipping background write for deleted file ${path.basename(entry.filePath)}`)
-        this.backgroundDocs.delete(docId)
+        this.registry.deleteBackground(docId)
         return
       }
       const lfText = entry.yDoc.getText("content").toString()
@@ -520,19 +475,13 @@ export class YjsBridge {
     }, 300)
   }
 
-  private findEditorForFile(filePath: string): vscode.TextEditor | undefined {
-    return vscode.window.visibleTextEditors.find(
-      (e) => e.document.uri.scheme === "file" && e.document.uri.fsPath === filePath
-    )
-  }
-
   /**
    * Push the Y.Doc text into its editor using a minimal prefix/suffix replace,
    * so decorations (cursors, selections) outside the changed region survive.
    */
   private async applyDocToEditor(entry: DocEntry, retries = 3, onSuccess?: () => void): Promise<void> {
     const lfText = entry.yDoc.getText("content").toString()
-    const liveEditor = this.findEditorForFile(entry.filePath)
+    const liveEditor = findEditorForFile(entry.filePath)
     if (liveEditor) entry.editor = liveEditor
 
     let doc = entry.editor.document
@@ -584,26 +533,20 @@ export class YjsBridge {
     const cursor = entry.pendingCursor
     if (!cursor) return
     entry.pendingCursor = null
-    const docId = this.findDocIdForEntry(entry)
+    const docId = this.registry.findDocIdForEntry(entry)
     if (docId && cursor.userId !== this.wsManager.userId) {
       this.applyRemoteCursor(docId, entry, cursor)
     }
   }
 
-  private findDocIdForEntry(entry: DocEntry): string | null {
-    for (const [docId, e] of this.docs) {
-      if (e === entry) return docId
-    }
-    return null
-  }
-
   private handleDocClose(doc: vscode.TextDocument): void {
-    for (const [docId, entry] of this.docs) {
+    for (const [docId, entry] of this.registry.docEntries()) {
       if (entry.editor.document !== doc) continue
       this.sendCursorClear(docId)
-      const handler = this.updateHandlers.get(docId)
-      if (handler) { entry.yDoc.off("update", handler); this.updateHandlers.delete(docId) }
-      this.docs.delete(docId)
+      const handler = this.registry.getHandler(docId)
+      entry.yDoc.off("update", handler)
+      this.registry.deleteHandler(docId)
+      this.registry.deleteDoc(docId)
       const bgEntry: BackgroundEntry = {
         yDoc: entry.yDoc,
         filePath: entry.filePath,
@@ -611,9 +554,9 @@ export class YjsBridge {
         writeTimer: null,
         hasReceivedState: entry.hasReceivedState,
       }
-      this.backgroundDocs.set(docId, bgEntry)
+      this.registry.setBackground(docId, bgEntry)
       const bgHandler = this.createUpdateHandler(docId, entry.yDoc)
-      this.updateHandlers.set(docId, bgHandler)
+      this.registry.setHandler(docId, bgHandler)
       entry.yDoc.on("update", bgHandler)
       log.appendLine(`[yjsBridge] editor closed, demoted to background: ${path.basename(entry.filePath)}`)
       return
@@ -621,7 +564,7 @@ export class YjsBridge {
   }
 
   private handleLocalEdit(e: vscode.TextDocumentChangeEvent): void {
-    for (const [, entry] of this.docs) {
+    for (const [, entry] of this.registry.docEntries()) {
       if (entry.editor.document !== e.document) continue
       if (entry.applyingRemote > 0) return
       if (this.currentRole === "viewer") {
@@ -710,7 +653,7 @@ export class YjsBridge {
   }
 
   private applyRemoteCursor(docId: string, entry: DocEntry, payload: CursorPayload): void {
-    const liveEditor = this.findEditorForFile(entry.filePath) ?? entry.editor
+    const liveEditor = findEditorForFile(entry.filePath) ?? entry.editor
     this.cursorRenderer.apply(payload, liveEditor)
     void docId
   }
@@ -739,7 +682,7 @@ export class YjsBridge {
         editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport)
       })().catch(() => {})
     } else {
-      const editor = this.findEditorForFile(filePath)
+      const editor = findEditorForFile(filePath)
       if (editor) editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport)
     }
   }
@@ -750,25 +693,23 @@ export class YjsBridge {
 
   dispose(): void {
     if (this.viewerResyncTimer) { clearTimeout(this.viewerResyncTimer); this.viewerResyncTimer = null }
-    for (const [docId, entry] of this.docs) {
+    for (const [docId, entry] of this.registry.docEntries()) {
       this.wsManager.sendJson({ type: "unsubscribeDoc", docId: docId as DocId })
-      const h = this.updateHandlers.get(docId)
-      if (h) entry.yDoc.off("update", h)
+      const h = this.registry.getHandler(docId)
+      entry.yDoc.off("update", h)
       entry.yDoc.destroy()
     }
-    for (const [docId, bgEntry] of this.backgroundDocs) {
+    for (const [docId, bgEntry] of this.registry.backgroundEntries()) {
       this.wsManager.sendJson({ type: "unsubscribeDoc", docId: docId as DocId })
       if (bgEntry.writeTimer) clearTimeout(bgEntry.writeTimer)
-      const h = this.updateHandlers.get(docId)
-      if (h) bgEntry.yDoc.off("update", h)
+      const h = this.registry.getHandler(docId)
+      bgEntry.yDoc.off("update", h)
       bgEntry.yDoc.destroy()
     }
-    this.updateHandlers.clear()
     for (const timer of this.selectionTimers.values()) clearTimeout(timer)
     this.selectionTimers.clear()
     this.cursorRenderer.dispose()
-    this.docs.clear()
-    this.backgroundDocs.clear()
+    this.registry.clear()
     this.viewerUi.dispose()
     this.disposables.forEach((d) => d.dispose())
   }
