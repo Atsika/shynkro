@@ -8,7 +8,7 @@ import type { StateDb } from "../state/stateDb"
 import type { AwarenessController } from "./awarenessController"
 import type { TextSyncEngine } from "./textSyncEngine"
 import type { BackgroundEntry, DocRegistry } from "./docRegistry"
-import { buildBinaryFrame } from "./yjsFrames"
+import { buildBinaryFrame, buildYjsUpdateFrame, generateClientUpdateId } from "./yjsFrames"
 import { maybeCompact } from "./yjsPersistence"
 import { encodeTextForDisk, defaultEol } from "../text/textNormalize"
 import { atomicWriteFileSync } from "../text/atomicWrite"
@@ -34,22 +34,44 @@ export class YjsFrameRouter {
   /**
    * Factory for the `yDoc.on("update")` handler. Every mount site (openDoc,
    * subscribeBackground, handleDocClose → background) shares the same policy:
-   * persist local + remote updates, send locals over the wire, ack on send,
-   * and nudge the compactor.
+   * persist local + remote updates, send locals over the wire, and nudge the
+   * compactor.
+   *
+   * Local rows are NEVER marked acked here — the server sends a
+   * `yjsUpdateAck` JSON message after `persistUpdate()` commits, which is
+   * the only signal that proves durability. See {@link handleAck}.
    */
   createUpdateHandler(docId: string, yDoc: Y.Doc): (update: Uint8Array, origin: unknown) => void {
     return (update, origin) => {
       if (origin === "local-restore") return
       const isLocal = origin !== "remote"
-      const acked = !isLocal
-      const id = this.stateDb.appendYjsUpdate(docId, update, isLocal ? "local" : "remote", acked)
       if (isLocal) {
-        const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, docId, update)
-        const sent = this.wsManager.sendBinary(frame)
-        if (sent) this.stateDb.markYjsUpdateAcked(id)
+        const clientUpdateId = generateClientUpdateId()
+        this.stateDb.appendYjsUpdate(docId, update, "local", false, clientUpdateId)
+        const frame = buildYjsUpdateFrame(docId, clientUpdateId, update)
+        this.wsManager.sendBinary(frame)
+        // Ack on persisted-server-commit, not on ws.send success.
+      } else {
+        this.stateDb.appendYjsUpdate(docId, update, "remote", true)
       }
       maybeCompact(this.stateDb, docId, yDoc)
     }
+  }
+
+  /**
+   * Server confirmed `persistUpdate()` for our sender-private clientUpdateId.
+   * Retire the row and nudge the compactor so the next threshold check can
+   * reclaim the now-durable state.
+   */
+  handleAck(docId: string, clientUpdateId: string): void {
+    this.stateDb.markYjsUpdateAckedByClientId(clientUpdateId)
+    const entry = this.registry.getDoc(docId)
+    if (entry) {
+      maybeCompact(this.stateDb, docId, entry.yDoc)
+      return
+    }
+    const bgEntry = this.registry.getBackground(docId)
+    if (bgEntry) maybeCompact(this.stateDb, docId, bgEntry.yDoc)
   }
 
   handleBinaryFrame(frame: { frameType: number; docId: string; data: Uint8Array }): void {

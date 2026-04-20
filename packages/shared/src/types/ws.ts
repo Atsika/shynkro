@@ -1,11 +1,24 @@
 import type { DocId, FileId, FileKind, Role, UserId, WorkspaceId } from "./workspace.js"
 
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 // Binary frame type bytes
 export const WS_BINARY_YJS_UPDATE = 0x01
 export const WS_BINARY_YJS_STATE = 0x02
 export const WS_BINARY_AWARENESS = 0x03
+
+/**
+ * Wire layouts (sender → server):
+ *   YJS_UPDATE   : [type(1)][docId(16)][clientUpdateId(16)][update(N)]
+ *   AWARENESS    : [type(1)][docId(16)][payload(N)]
+ * Server → peers (rebroadcast):
+ *   YJS_UPDATE   : [type(1)][docId(16)][update(N)]  — clientUpdateId stripped
+ *   YJS_STATE    : [type(1)][docId(16)][state(N)]
+ *   AWARENESS    : [type(1)][docId(16)][payload(N)]
+ * The clientUpdateId is sender-private. After the server's persistUpdate()
+ * commits, a JSON YjsUpdateAckMessage (docId + clientUpdateId) is sent back
+ * to the sender so the row can be retired from its local unacked queue.
+ */
 
 // ---- Client → Server (text frames) ----
 
@@ -200,6 +213,19 @@ export interface DocResetMessage {
   docId: DocId
 }
 
+/**
+ * Sent by the server to the originating client after `persistUpdate(docId,
+ * update)` commits successfully. The client uses `clientUpdateId` to mark the
+ * corresponding row in its local unacked queue as durable. Without this ack,
+ * socket death between `ws.send` and server-side commit would silently lose
+ * the update.
+ */
+export interface YjsUpdateAckMessage {
+  type: "yjsUpdateAck"
+  docId: DocId
+  clientUpdateId: string
+}
+
 export interface PongMessage {
   type: "pong"
 }
@@ -236,4 +262,5 @@ export type ServerMessage =
   | DocSubscribedMessage
   | DocResetMessage
   | ServerShutdownMessage
+  | YjsUpdateAckMessage
   | PongMessage

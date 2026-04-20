@@ -1,21 +1,8 @@
 import * as vscode from "vscode"
 // Node 22+ has global WebSocket (stable)
-import { PROTOCOL_VERSION, WS_BINARY_YJS_UPDATE } from "@shynkro/shared"
+import { PROTOCOL_VERSION } from "@shynkro/shared"
 import type { ClientMessage, ServerMessage, WorkspaceId } from "@shynkro/shared"
-
-function uuidToBytes(uuid: string): Uint8Array {
-  const hex = uuid.replace(/-/g, "")
-  const bytes = new Uint8Array(16)
-  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  return bytes
-}
-function buildBinaryFrame(frameType: number, docId: string, data: Uint8Array): Uint8Array {
-  const frame = new Uint8Array(1 + 16 + data.length)
-  frame[0] = frameType
-  frame.set(uuidToBytes(docId), 1)
-  frame.set(data, 17)
-  return frame
-}
+import { buildYjsUpdateFrame, generateClientUpdateId } from "../yjs/yjsFrames"
 import {
   EXTENSION_VERSION,
   RECONNECT_BASE_MS,
@@ -183,18 +170,28 @@ export class WsManager {
       //   subscribeWorkspace → offline frames → subscribeDoc
       // so the server applies the offline edits before computing the state to send.
       if (this.stateDb) {
-        // V6: flush all unacked local Yjs updates. Each row carries doc_id +
-        // raw update bytes; rebuild the wire frame here so storage stays
-        // origin-format-agnostic. Mark acked on successful send.
+        // V7: flush all unacked local Yjs updates. Each row carries doc_id,
+        // update bytes, and a clientUpdateId the server echoes back in
+        // `yjsUpdateAck`. Rows are NOT marked acked on send — only on receipt
+        // of the ack — so a socket death between send and server-side commit
+        // cannot silently lose the update (the next flush resends it).
+        //
+        // Legacy rows pre-dating V7 have been backfilled with UUIDs during
+        // migration, so every row here has a non-null clientUpdateId. The
+        // fallback below is defence-in-depth only.
         const rows = this.stateDb.loadAllUnackedLocalUpdates()
         if (rows.length > 0) {
           log.appendLine(`[ws] flushing ${rows.length} persisted Yjs update(s) after reconnect`)
           for (const row of rows) {
             if (this.ws?.readyState !== WebSocket.OPEN) break
             try {
-              const frame = buildBinaryFrame(WS_BINARY_YJS_UPDATE, row.docId, row.bytes)
+              let cuid = row.clientUpdateId
+              if (!cuid) {
+                cuid = generateClientUpdateId()
+                this.stateDb.setYjsUpdateClientId(row.id, cuid)
+              }
+              const frame = buildYjsUpdateFrame(row.docId, cuid, row.bytes)
               this.ws.send(frame)
-              this.stateDb.markYjsUpdateAcked(row.id)
             } catch (err) {
               log.appendLine(`[ws] flush send error for update ${row.id}: ${err}`)
               break
