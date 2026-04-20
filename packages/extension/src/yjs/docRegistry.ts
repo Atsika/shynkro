@@ -4,13 +4,36 @@ import * as Y from "yjs"
 import type { CursorPayload, FileId, WorkspaceId } from "@shynkro/shared"
 import { log } from "../logger"
 
+/**
+ * Signature of the next programmatic `applyEdit` we expect VS Code to fire
+ * onto the doc. `handleLocalEdit` consumes the matching contentChange so it
+ * is not round-tripped back into the Y.Doc as a duplicate user edit, and
+ * processes any additional changes in the same event as real user input.
+ *
+ * `expiresAt` is a safety net: if the event never fires (applyEdit rejected,
+ * no-op collapse, etc.) the fence lifts automatically after 500 ms so real
+ * user keystrokes aren't held hostage forever.
+ */
+export interface PendingEditorWrite {
+  change: { rangeOffset: number; rangeLength: number; text: string }
+  expiresAt: number
+}
+
 export interface DocEntry {
   yDoc: Y.Doc
   fileId: FileId
   filePath: string
   workspaceId: WorkspaceId
   editor: vscode.TextEditor
+  /**
+   * Counter held only across synchronous remote Y.Doc mutations — currently
+   * the brief window between `fs.readFileSync` and `applyOps` in
+   * `handleExternalTextEdit`. Not held across async editor writes (that is
+   * what `pendingEditorWrite` is for), which is the fix for D4: user
+   * keystrokes during the async `applyEdit` no longer disappear.
+   */
   applyingRemote: number
+  pendingEditorWrite: PendingEditorWrite | null
   hasReceivedState: boolean
   pendingCursor: CursorPayload | null
   /**

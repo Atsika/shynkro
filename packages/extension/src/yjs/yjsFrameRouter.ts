@@ -87,27 +87,25 @@ export class YjsFrameRouter {
       if (entry.recoveryMode) return
       if (frame.frameType === WS_BINARY_YJS_STATE || frame.frameType === WS_BINARY_YJS_UPDATE) {
         const isInitialState = frame.frameType === WS_BINARY_YJS_STATE
-        // Hold the suppression flag across Y.applyUpdate and the editor
-        // write-back: a keystroke that lands between Y.applyUpdate and
-        // applyDocToEditor would otherwise be overwritten by the stale diff
-        // ranges computed against pre-keystroke text.
-        entry.applyingRemote++
-        try {
-          Y.applyUpdate(entry.yDoc, frame.data, "remote")
-          if (isInitialState) {
-            // Server state arrived: ack any local updates it already absorbed.
-            this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
-            entry.hasReceivedState = true
-          }
-        } catch (err) {
-          entry.applyingRemote--
-          throw err
+        // Y.applyUpdate is synchronous — no event-loop yield means no
+        // keystroke can race it. The update handler discriminates our own
+        // edits via origin==="remote", so this does not re-enter as local.
+        Y.applyUpdate(entry.yDoc, frame.data, "remote")
+        if (isInitialState) {
+          // Server state arrived: ack any local updates it already absorbed.
+          this.trimAckedLocalUpdates(frame.docId, frame.data, entry.yDoc)
+          entry.hasReceivedState = true
         }
+        // applyDocToEditor fences itself via pendingEditorWrite — user
+        // keystrokes during its async applyEdit are preserved in Y.Doc
+        // instead of being silently dropped (fix for D4).
         this.textSync.applyDocToEditor(entry)
           .catch((err) => log.appendLine(`[yjsBridge] applyDocToEditor rejected: ${err}`))
-          .finally(() => { entry.applyingRemote-- })
       } else if (frame.frameType === WS_BINARY_AWARENESS) {
-        if (entry.applyingRemote > 0) {
+        // Defer remote cursor render until the editor buffer has caught up
+        // with the remote write — otherwise the cursor position applies
+        // against stale text and jumps when the buffer rewrites.
+        if (entry.pendingEditorWrite || entry.applyingRemote > 0) {
           try {
             const payload = JSON.parse(Buffer.from(frame.data).toString("utf-8")) as CursorPayload
             if (payload.userId !== this.awareness.selfUserId) entry.pendingCursor = payload
