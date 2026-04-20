@@ -217,7 +217,13 @@ export class TextSyncEngine {
       return
     }
     const bgEntry = this.registry.getBackground(docId)
-    if (bgEntry && bgEntry.hasReceivedState) {
+    if (bgEntry) {
+      // Always merge external disk edits into the Y.Doc — the prefix/suffix
+      // diff is computed against the current Y.Text at apply time, so the
+      // merge is correct regardless of whether the server's initial STATE
+      // has arrived. The disk-write-back path (scheduleBackgroundWrite)
+      // separately gates on hasReceivedState to avoid echoing pre-sync
+      // content back to disk.
       applyOps(bgEntry.yDoc)
     }
   }

@@ -17,7 +17,19 @@ export const LOCAL_COMPACT_THRESHOLD = 500
  * authoritative state. Yjs CRDT semantics guarantee convergence regardless
  * of order.
  */
-export function hydrateFromLocal(stateDb: StateDb, docId: string): Y.Doc {
+export interface HydrateResult {
+  yDoc: Y.Doc
+  /**
+   * True when the caller should treat the hydrated state as "meaningful" —
+   * either a snapshot or at least one update existed in SQLite. Used to
+   * decide whether to project the Y.Doc onto the editor before the server
+   * replies, and to seed `hasReceivedState` on background entries so the
+   * first external disk-edit does not drop on the floor.
+   */
+  hasLocalState: boolean
+}
+
+export function hydrateFromLocal(stateDb: StateDb, docId: string): HydrateResult {
   const yDoc = new Y.Doc()
   const snapshot = stateDb.loadYjsSnapshot(docId)
   if (snapshot) {
@@ -27,10 +39,11 @@ export function hydrateFromLocal(stateDb: StateDb, docId: string): Y.Doc {
   for (const u of updates) {
     Y.applyUpdate(yDoc, u.bytes, u.origin === "remote" ? "remote" : "local-restore")
   }
-  if (snapshot || updates.length > 0) {
+  const hasLocalState = !!snapshot || updates.length > 0
+  if (hasLocalState) {
     log.appendLine(`[yjsBridge] hydrated ${docId}: snapshot=${!!snapshot} updates=${updates.length}`)
   }
-  return yDoc
+  return { yDoc, hasLocalState }
 }
 
 /**
