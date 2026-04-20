@@ -472,15 +472,30 @@ export class StateDb {
   }
 
   /**
-   * Replace the snapshot and clear all updates whose id is <= upToId. Used by
-   * the compactor: after writing a fresh snapshot, the updates it subsumes are
-   * no longer needed.
+   * Replace the snapshot and clear subsumed updates whose id is <= upToId.
+   *
+   * Preserves rows that are NOT proven durable: `origin='local' AND acked=0`
+   * stay in the log so the reconnect flush can still resend them. Without
+   * this filter, compaction under churn can silently delete in-flight local
+   * edits the server has not yet confirmed.
+   *
+   * `update_count` is recomputed from the post-delete row count inside the
+   * transaction — the caller does not need to estimate it.
    */
-  replaceYjsSnapshot(docId: string, snapshot: Uint8Array, upToUpdateId: number, totalUpdatesAfter: number): void {
+  replaceYjsSnapshot(docId: string, snapshot: Uint8Array, upToUpdateId: number): void {
     const buf = Buffer.from(snapshot)
     const now = Date.now()
     this.db.exec("BEGIN")
     try {
+      this.db
+        .prepare(`
+          DELETE FROM yjs_local_updates
+          WHERE doc_id = ? AND id <= ? AND (origin = 'remote' OR acked = 1)
+        `)
+        .run(docId, upToUpdateId)
+      const remaining = (this.db
+        .prepare("SELECT COUNT(*) as c FROM yjs_local_updates WHERE doc_id = ?")
+        .get(docId) as { c: number }).c
       this.db
         .prepare(`
           INSERT INTO yjs_local_state (doc_id, snapshot, update_count, updated_at)
@@ -490,8 +505,7 @@ export class StateDb {
             update_count = excluded.update_count,
             updated_at = excluded.updated_at
         `)
-        .run(docId, buf, totalUpdatesAfter, now)
-      this.db.prepare("DELETE FROM yjs_local_updates WHERE doc_id = ? AND id <= ?").run(docId, upToUpdateId)
+        .run(docId, buf, remaining, now)
       this.db.exec("COMMIT")
     } catch (err) {
       this.db.exec("ROLLBACK")
