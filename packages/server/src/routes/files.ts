@@ -291,6 +291,15 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
       }
 
       const oldPath = file.path
+      const isFolder = file.kind === "folder"
+      const oldPrefix = oldPath + "/"
+      const newPrefix = body.path + "/"
+
+      // Reject renaming a folder into its own descendant (would create an
+      // unreachable cycle and leave orphaned paths after the cascade).
+      if (isFolder && body.path.startsWith(oldPrefix)) {
+        return status(400, { message: "Cannot rename a folder into its own descendant" })
+      }
 
       // Pre-check case-insensitive collision with any *other* live file in this workspace.
       const [collision] = await db
@@ -312,6 +321,57 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         })
       }
 
+      // Folder renames must drag every descendant along. Gather them now so we
+      // can (a) pre-check for collisions with non-descendant files at the
+      // target prefix, and (b) broadcast a fileRenamed for each descendant
+      // after the transaction commits.
+      type DescendantRename = { fileId: string; oldPath: string; newPath: string }
+      let descendants: DescendantRename[] = []
+      if (isFolder) {
+        const rows = await db
+          .select({ id: fileEntries.id, path: fileEntries.path })
+          .from(fileEntries)
+          .where(
+            and(
+              eq(fileEntries.workspaceId, params.id),
+              eq(fileEntries.deleted, false),
+              sql`${fileEntries.path} LIKE ${oldPrefix + "%"}`
+            )
+          )
+        descendants = rows.map((r) => ({
+          fileId: r.id,
+          oldPath: r.path,
+          newPath: newPrefix + r.path.slice(oldPrefix.length),
+        }))
+
+        // Collision check: any non-descendant live file whose path matches a
+        // target descendant path (case-insensitive) would collide after the
+        // cascade. Descendants themselves are excluded via the NOT LIKE clause
+        // so a pure case-only folder rename (foo → FOO) is allowed.
+        if (descendants.length > 0) {
+          const targetsLower = descendants.map((d) => d.newPath.toLowerCase())
+          const [descCollision] = await db
+            .select({ path: fileEntries.path })
+            .from(fileEntries)
+            .where(
+              and(
+                eq(fileEntries.workspaceId, params.id),
+                eq(fileEntries.deleted, false),
+                sql`lower(${fileEntries.path}) = ANY(${targetsLower})`,
+                sql`${fileEntries.path} NOT LIKE ${oldPrefix + "%"}`,
+                sql`${fileEntries.id} <> ${params.fileId}`
+              )
+            )
+            .limit(1)
+          if (descCollision) {
+            return status(409, {
+              code: "PATH_CASE_COLLISION",
+              message: `Cannot rename folder to "${body.path}" — would collide with existing file "${descCollision.path}".`,
+            })
+          }
+        }
+      }
+
       // Concurrency note: the collision pre-check runs *outside* this transaction, so
       // a racing INSERT / UPDATE can still land between the check and the UPDATE. The
       // partial unique index `file_entries_ws_path_ci_idx` is the source of truth for
@@ -326,6 +386,20 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
             .update(fileEntries)
             .set({ path: body.path, updatedAt: new Date() })
             .where(eq(fileEntries.id, params.fileId))
+          // Cascade descendant paths (folder rename). One bulk UPDATE by
+          // rewriting only the leading prefix; trailing slashes on oldPrefix /
+          // newPrefix guarantee we don't match a same-prefix sibling like
+          // "foobar/" when renaming "foo/".
+          if (isFolder && descendants.length > 0) {
+            await tx.execute(
+              sql`UPDATE file_entries
+                  SET path = ${newPrefix} || substring(path from ${oldPrefix.length + 1}),
+                      updated_at = NOW()
+                  WHERE workspace_id = ${params.id}
+                    AND deleted = false
+                    AND path LIKE ${oldPrefix + "%"}`
+            )
+          }
           revision = await incrementRevision(params.id, tx)
         })
       } catch (err) {
@@ -346,8 +420,29 @@ export const fileRoutes = new Elysia({ prefix: "/api/v1/workspaces/:id/files" })
         oldPath,
         revision,
       })
-
       await recordChange({ workspaceId: params.id, revision, type: "fileRenamed", fileId: params.fileId, path: body.path, oldPath })
+
+      // Broadcast and log a fileRenamed for each descendant so every peer's
+      // changeReconciler can apply the move locally. They share the same
+      // revision as the parent rename — one atomic batch.
+      for (const d of descendants) {
+        broadcastToWorkspace(params.id, {
+          type: "fileRenamed",
+          workspaceId: params.id,
+          fileId: d.fileId,
+          path: d.newPath,
+          oldPath: d.oldPath,
+          revision,
+        })
+        await recordChange({
+          workspaceId: params.id,
+          revision,
+          type: "fileRenamed",
+          fileId: d.fileId,
+          path: d.newPath,
+          oldPath: d.oldPath,
+        })
+      }
 
       const response = { fileId: params.fileId, path: body.path, revision }
       if (opId) await writeIdempotencyCache(params.id, opId, 200, response)
